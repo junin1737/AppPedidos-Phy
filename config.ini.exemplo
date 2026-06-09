@@ -1,0 +1,37 @@
+[firebird]
+database = C:\Work\MT\Cliente\Clipp\Base\CLIPP.FDB
+user = SYSDBA
+password = masterkey
+charset = WIN1252
+fbclient_path = fbclient64.dll
+connection_timeout = 20
+host = localhost
+port = 3050
+use_server = true
+
+[ocr]
+tesseract_cmd = C:\Program Files\Tesseract-OCR\tesseract.exe
+poppler_path =
+lang = por
+
+[nfvenda]
+id_sermod = 99
+nf_serie = 2
+nf_modelo = 99
+nf_tipo = S
+
+[venda]
+id_vendedor = 17
+xx_vendedor = 17
+id_planoconta = 22
+cc_custo = 23
+
+[rpa]
+base_url = https://www.tiaocards.com.br/
+usuario =
+senha =
+browser_channel = chrome
+chrome_debug_url =
+
+[extensao]
+porta = 8765

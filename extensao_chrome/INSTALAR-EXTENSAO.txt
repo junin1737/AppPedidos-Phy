@@ -1,0 +1,17 @@
+EXTENSAO CHROME — AppPedidos CLIPP
+==================================
+
+1. No Chrome, abra: chrome://extensions
+2. Ative "Modo do desenvolvedor" (canto superior direito)
+3. Clique "Carregar sem compactacao"
+4. Selecione ESTA pasta (extensao_chrome)
+5. Fixe o icone na barra do Chrome
+
+Requisito: servidor CLIPP rodando na bandeja (icone perto do relogio).
+
+Para outro PC: copie a pasta extensao_chrome inteira (pen drive ou rede)
+e repita os passos acima. Nao precisa reinstalar o servidor nesse PC se
+so for usar o Chrome de outra maquina apontando para o mesmo servidor
+na rede — nesse caso altere PORTA/host no popup.js (avancado).
+
+Porta padrao do servidor: 8765 (config.ini, secao [extensao]).

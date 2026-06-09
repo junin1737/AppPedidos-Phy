@@ -1,0 +1,16 @@
+config.ini
+.rpa_profile/
+.cursor/
+pedidos_rpa.json
+__pycache__/
+*.pyc
+.venv/
+*.log
+faltantes/
+dados/
+instalador/redist/
+instalador/dist/
+instalador/payload/
+instalador/staging_zip/
+fbclient64.dll
+fbclient.dll

@@ -1,0 +1,14 @@
+"""Tamanhos máximos dos campos (conforme Metadatas.txt / TB_CLIENTE)."""
+
+NOME = 60
+END_CEP = 9
+END_TIPO = 15
+END_LOGRAD = 40
+END_NUMERO = 5
+END_BAIRRO = 35
+END_COMPLE = 29
+DDD_CELUL = 2
+FONE_CELUL = 13
+OBSERVACAO = 1000
+ID_PAIS = "1058"
+ID_CIDADE = 7

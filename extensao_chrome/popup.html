@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <title>Importar CLIPP</title>
+  <style>
+    body {
+      font-family: Segoe UI, sans-serif;
+      width: 320px;
+      margin: 12px;
+      font-size: 13px;
+    }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+    button {
+      width: 100%;
+      padding: 12px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      background: #1a73e8;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      position: relative;
+      z-index: 10;
+    }
+    button:not(:disabled):hover { background: #1558b0; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    #status { margin-top: 10px; white-space: pre-wrap; line-height: 1.4; }
+    .ok { color: #137333; }
+    .erro { color: #c5221f; }
+    .aviso { color: #e37400; }
+    .dica { color: #5f6368; font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Pedido → CLIPP</h1>
+  <p class="dica">Abra o <strong>detalhe do pedido</strong> no painel (Gerenciamento de Pedidos) e clique abaixo.</p>
+  <button type="button" id="btn">Importar esta página</button>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
