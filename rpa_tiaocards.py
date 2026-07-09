@@ -1,4 +1,8 @@
-"""RPA — extrai pedidos do painel Tiao Cards / LigaMagic e monta PedidoExtraido."""
+"""RPA — extrai pedidos do painel Tiao Cards / LigaMagic e monta PedidoExtraido.
+
+Duas entradas: parsear_html_pedido (extensão Chrome) e extrair_pedido_site
+(Playwright). Mantém pedidos_rpa.json para evitar reimportação duplicada.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -21,6 +26,7 @@ from parser_pedido import (
     REF_COM_HASH,
     REF_PADRAO,
     _extrair_raridade_bloco,
+    _extrair_reprint_bloco,
     _idioma_da_linha,
     _idioma_do_html,
     _idioma_sigla_bloco,
@@ -29,11 +35,17 @@ from parser_pedido import (
     _parse_moeda,
     _preservar_marcadores_html,
     _raridade_do_html,
+    _reprint_do_html,
     digitos_documento,
     formatar_documento,
     linha_e_apelido_nick,
+    SKU_SITE_PADRAO,
+    eh_sku_selado,
+    extrair_sku_texto,
+    listar_skus_texto,
     montar_referencia_clipp,
     normalizar_referencia_site,
+    _nucleo_referencia,
 )
 
 from db import _separar_tipo_logradouro, normalizar_endereco_cliente
@@ -45,6 +57,10 @@ ROOT = Path(__file__).resolve().parent
 PERFIL_RPA = ROOT / ".rpa_profile"
 SESSAO_RPA = PERFIL_RPA / "session.json"
 
+
+# ---------------------------------------------------------------------------
+# Controle local — pedidos_rpa.json (já importados pela extensão/RPA)
+# ---------------------------------------------------------------------------
 
 def _arquivo_controle_pedidos() -> Path:
     from config import pedidos_controle_path
@@ -114,6 +130,10 @@ def limpar_todo_controle_local() -> int:
     return n
 
 
+# ---------------------------------------------------------------------------
+# Cliente e endereço — parse do bloco HTML/texto da página de detalhe do pedido
+# ---------------------------------------------------------------------------
+
 def _limpar_nome_cliente(texto: str) -> str:
     nome = re.sub(r"\s*\([^)]+\)\s*$", "", (texto or "").strip())
     return nome.strip()
@@ -121,7 +141,16 @@ def _limpar_nome_cliente(texto: str) -> str:
 
 _LINHA_NOME_IGNORAR = re.compile(
     r"^avaliar|^padr[aã]o\s+cliente$|^endere[cç]o\s+do\s+cliente$|^cliente$|"
-    r"^forma\s+de|^confirma|^itens\s+do|^pagamento$|^envio$|^imprimir",
+    r"^forma\s+de|^confirma|^itens\s+do|^pagamento$|^envio$|^imprimir|"
+    r"^alterar\s+endere[cç]o|^atualizar\s+valor|^nota\s+fiscal$|^cancelar\b",
+    re.I,
+)
+
+# Aviso do Tiao Cards no bloco de endereço (não é bairro/complemento).
+_AVISO_ENDERECO_RE = re.compile(
+    r"possivelmente\s+incorret|verifique\s+o\s+endere|antes\s+de\s+realizar|"
+    r"foi\s+ajustad|evitar\s+que\s+os\s+produt|garantir\s+que\s+o\s+endere|"
+    r"^cancelar\b",
     re.I,
 )
 
@@ -195,6 +224,29 @@ def _linha_lixo_endereco(lin: str, apelido: str | None = None) -> bool:
     if re.match(r"^\([A-Za-z0-9][A-Za-z0-9_\-\.]{1,39}\s*$", s):
         return True
     return False
+
+
+def _parece_logradouro(s: str) -> bool:
+    """Linha que claramente é um logradouro (compacto «X, 123» ou com tipo)."""
+    s = (s or "").strip()
+    if not s:
+        return False
+    if "," in s and re.search(r"\d", s):
+        return True
+    return bool(re.match(
+        r"^(rua|av\.?|avenida|travessa|alameda|rod\.?|estrada|r\.)\s",
+        s, re.I,
+    ))
+
+
+def _bare_nick_candidato(s: str) -> bool:
+    """Token único (ex.: «Jdai») que parece apelido do site, não endereço."""
+    s = (s or "").strip()
+    if not s or _parece_logradouro(s):
+        return False
+    if re.match(r"^N[uú]mero\b", s, re.I):
+        return False
+    return bool(re.fullmatch(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9_.\-]{1,39}", s))
 
 
 def _parse_bloco_endereco_cliente(linhas_cli: list[str]) -> dict:
@@ -271,11 +323,22 @@ def _parse_bloco_endereco_cliente(linhas_cli: list[str]) -> dict:
 
     idx = 1
     apelido = cli.get("apelido_site") or apelido_bloco
-    while idx < len(restantes) and _linha_lixo_endereco(restantes[idx], apelido):
+    tem_logradouro_depois = any(_parece_logradouro(r) for r in restantes[1:])
+    while idx < len(restantes):
         lin_skip = restantes[idx].strip()
-        if not cli.get("apelido_site") and linha_e_apelido_nick(lin_skip):
-            cli["apelido_site"] = lin_skip[:40]
-        idx += 1
+        if _linha_lixo_endereco(lin_skip, apelido):
+            if not cli.get("apelido_site") and linha_e_apelido_nick(lin_skip):
+                cli["apelido_site"] = lin_skip[:40]
+            idx += 1
+            continue
+        # Apelido «pelado» (ex.: «Jdai», sem parênteses) quando ainda há um
+        # logradouro de verdade nas próximas linhas: trata como apelido, não rua.
+        if tem_logradouro_depois and _bare_nick_candidato(lin_skip):
+            if not cli.get("apelido_site"):
+                cli["apelido_site"] = lin_skip[:40]
+            idx += 1
+            continue
+        break
 
     if idx < len(restantes):
         lin_log = restantes[idx]
@@ -309,24 +372,27 @@ def _parse_bloco_endereco_cliente(linhas_cli: list[str]) -> dict:
                     cli["end_numero"] = num[: lim.END_NUMERO]
         idx += 1
 
-    if idx < len(restantes):
-        lin_pos = restantes[idx].strip()
-        if lin_pos and not _linha_lixo_endereco(lin_pos, apelido):
-            if not cli.get("texto_complemento_site"):
-                cli["texto_complemento_site"] = lin_pos
-            elif not cli.get("end_bairro"):
-                cli["end_bairro"] = lin_pos[: lim.END_BAIRRO]
+    # Linhas restantes entre número e Cidade/UF: no layout Tiao Cards a ÚLTIMA
+    # é o BAIRRO; linhas anteriores (quando houver) são complemento. Antes a
+    # primeira virava complemento e o bairro ficava vazio (ou pegava o botão
+    # «Alterar Endereço»).
+    extras: list[str] = []
+    while idx < len(restantes):
+        lin_x = restantes[idx].strip()
         idx += 1
-
-    if idx < len(restantes):
-        lin_b = restantes[idx].strip()
-        if (
-            lin_b
-            and not _linha_lixo_endereco(lin_b, apelido)
-            and not cli.get("end_bairro")
-        ):
-            cli["end_bairro"] = lin_b[: lim.END_BAIRRO]
-        idx += 1
+        if not lin_x or _linha_lixo_endereco(lin_x, apelido):
+            continue
+        # Ignora o aviso «Endereço possivelmente incorreto…» do Tiao Cards e
+        # textos longos (não são bairro/complemento, que são curtos).
+        if _AVISO_ENDERECO_RE.search(lin_x) or len(lin_x) > 60:
+            continue
+        extras.append(lin_x)
+    if extras:
+        if not cli.get("end_bairro"):
+            cli["end_bairro"] = extras[-1][: lim.END_BAIRRO]
+            extras = extras[:-1]
+        if extras and not cli.get("texto_complemento_site"):
+            cli["texto_complemento_site"] = " ".join(extras)
 
     seg_site: list[str] = []
     if cli.get("end_tipo") or cli.get("end_lograd"):
@@ -347,6 +413,10 @@ def _parse_bloco_endereco_cliente(linhas_cli: list[str]) -> dict:
 
     return cli
 
+
+# ---------------------------------------------------------------------------
+# Totais do pedido — frete, desconto e conferência de valores no rodapé
+# ---------------------------------------------------------------------------
 
 def _extrair_resumo_valores_pedido(texto: str, pedido: PedidoExtraido) -> None:
     """Frete, desconto e totais no rodapé do pedido."""
@@ -454,6 +524,10 @@ def _extrair_secao(texto: str, titulo: str, proximos: tuple[str, ...]) -> str:
     return trecho[:fim].strip()
 
 
+# ---------------------------------------------------------------------------
+# HTML → texto — strip de tags e normalização para o parser de itens
+# ---------------------------------------------------------------------------
+
 def _html_para_texto(html: str) -> str:
     texto = re.sub(r"<[^>]+>", "\n", html)
     texto = re.sub(r"\n{2,}", "\n", texto)
@@ -495,8 +569,853 @@ def aplicar_idiomas_site(
             item.referencia_original or ref_orig,
             idioma,
             raridade=item.raridade,
+            reprint=item.reprint,
         )
 
+
+def aplicar_reprints_site(
+    pedido: PedidoExtraido, mapa: dict | None
+) -> None:
+    """Aplica reprint lido pela extensão por referência (autoritativo).
+
+    Quando a extensão envia o mapa, ele MANDA: cartas fora do mapa têm
+    reprint=False mesmo que a heurística de bloco/HTML tenha marcado — isso
+    evita o «RP» vazar para a carta vizinha.
+    """
+    if not mapa:
+        return
+    reprints: set[str] = set()
+    for chave, valor in mapa.items():
+        if not valor:
+            continue
+        ref = str(chave).strip().upper().lstrip("#")
+        if ref:
+            reprints.add(ref)
+
+    for item in pedido.itens:
+        if item.sku:
+            continue
+        ref_orig = (item.referencia_original or item.referencia or "").strip().upper()
+        novo = ref_orig in reprints
+        if novo == bool(item.reprint):
+            continue
+        item.reprint = novo
+        item.referencia = montar_referencia_clipp(
+            item.referencia_original or ref_orig,
+            item.idioma,
+            raridade=item.raridade,
+            reprint=novo,
+        )
+
+
+def aplicar_selados_extensao(
+    pedido: PedidoExtraido, selados: list[dict] | None
+) -> int:
+    """Injeta produtos selados lidos pela extensão Chrome (DOM)."""
+    if not selados:
+        return 0
+    chaves = {
+        (it.sku or it.referencia_original or "").upper()
+        for it in pedido.itens
+        if it.sku or it.referencia_original
+    }
+    inseridos = 0
+    for raw in selados:
+        if not isinstance(raw, dict):
+            continue
+        sku = str(raw.get("sku") or raw.get("referencia") or "").strip().upper()
+        if not sku or len(sku) < 3 or sku in chaves:
+            continue
+        descricao = str(raw.get("descricao") or sku)[:60]
+        if re.search(
+            r"#[A-Z0-9]{2,4}-(?:PT|EN|FR|P)\d",
+            descricao,
+            re.I,
+        ):
+            continue
+        preco_unit = float(raw.get("preco_unitario") or raw.get("preco") or 0)
+        preco_total = float(raw.get("preco_total") or 0)
+        qtd = int(raw.get("quantidade") or 0)
+        if qtd <= 0 and preco_unit > 0 and preco_total > 0:
+            qtd = _inferir_quantidade_preco(1, preco_unit, preco_total)
+        if qtd <= 0:
+            qtd = 1
+        if preco_total <= 0 and preco_unit > 0:
+            preco_total = round(preco_unit * qtd, 2)
+        elif preco_unit <= 0 and preco_total > 0 and qtd > 0:
+            preco_unit = round(preco_total / qtd, 2)
+        pedido.itens.insert(
+            0,
+            ItemPedido(
+                quantidade=qtd,
+                referencia_original=sku,
+                referencia=sku,
+                preco_unitario=preco_unit,
+                preco_total=preco_total or round(preco_unit * qtd, 2),
+                descricao=descricao,
+                sku=sku,
+            ),
+        )
+        chaves.add(sku)
+        inseridos += 1
+    return inseridos
+
+
+def _compact_ref(ref: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (ref or "").upper())
+
+
+def _referencia_consta_no_pedido(
+    item: ItemPedido,
+    texto_pedido: str,
+) -> bool:
+    """True se a ref/SKU/número Pokémon aparece no bloco de itens do pedido."""
+    t = (texto_pedido or "").upper()
+    if not t:
+        return True
+    t_compact = _compact_ref(t)
+    if item.sku:
+        sku = item.sku.upper().strip()
+        if sku in t or sku in t_compact:
+            return True
+    if item.numero and item.total:
+        pat = (
+            rf"#?\s*{re.escape(str(item.numero).strip())}\s*/\s*"
+            rf"{re.escape(str(item.total).strip())}\b"
+        )
+        if re.search(pat, t, re.I):
+            return True
+    for candidato in (item.referencia_original, item.referencia):
+        c = (candidato or "").strip().upper()
+        if not c:
+            continue
+        if c in t or f"#{c}" in t or f"({c}" in t:
+            return True
+        compact = _compact_ref(c)
+        if compact and compact in t_compact:
+            return True
+        # Código duplicado do site: BLGGBLGG-EN001
+        if len(compact) >= 8 and compact in t_compact:
+            return True
+    return False
+
+
+def _filtrar_itens_fora_do_pedido(
+    pedido: PedidoExtraido,
+    fonte_itens: str,
+) -> None:
+    """Descarta itens lidos fora da lista do pedido (ex.: recomendações na página)."""
+    if not fonte_itens or not pedido.itens:
+        return
+    mantidos: list[ItemPedido] = []
+    for it in pedido.itens:
+        if _referencia_consta_no_pedido(it, fonte_itens):
+            mantidos.append(it)
+            continue
+        rotulo = (
+            it.referencia_original
+            or it.referencia
+            or it.sku
+            or it.descricao
+            or "?"
+        )
+        pedido.erros.append(
+            f"AVISO: Item ignorado (referência não consta no pedido): {rotulo}"
+        )
+    pedido.itens = mantidos
+
+
+def _nucleo_base_ref(ref: str) -> str | None:
+    """SET+número ignorando sufixo de idioma (EN/PT/FR) — mesma carta no site."""
+    nucleo = _nucleo_referencia((ref or "").strip().upper())
+    if not nucleo:
+        return None
+    setor, _letras, num, tail = nucleo
+    return f"{setor}|{num}{tail}"
+
+
+def _nucleo_chave_conferencia(item: ItemPedido) -> str | None:
+    """Chave SET+número+preço, ignorando EN/PT/FR (evita falso «não importado»)."""
+    if item.sku:
+        return None
+    if item.numero and item.total:
+        return None
+    ref = (item.referencia_original or item.referencia or "").upper().strip()
+    base = _nucleo_base_ref(ref)
+    if not base:
+        return None
+    pu = round(float(item.preco_unitario or 0), 2)
+    return f"{base}|{pu}"
+
+
+def _bag_nucleo_conferencia(
+    itens: list[ItemPedido],
+) -> tuple[Counter, dict[str, ItemPedido]]:
+    bag: Counter = Counter()
+    exemplos: dict[str, ItemPedido] = {}
+    for it in itens:
+        k = _nucleo_chave_conferencia(it)
+        if not k:
+            continue
+        bag[k] += int(it.quantidade or 1)
+        exemplos.setdefault(k, it)
+    return bag, exemplos
+
+
+def _filtrar_falsos_positivos_relatorio(
+    importados: list[ItemPedido],
+    nao_imp: list[dict],
+) -> list[dict]:
+    """Remove do relatório cartas já importadas (ex.: LCJW-EN086 vs LCJW-PT086)."""
+    imp_nucleo: Counter = Counter()
+    for it in importados:
+        if it.sku:
+            continue
+        base = _nucleo_base_ref(it.referencia_original or it.referencia or "")
+        if base:
+            imp_nucleo[base] += int(it.quantidade or 1)
+
+    bag_frouxa, _ = _bag_itens_conferencia(
+        [it for it in importados if not it.sku], frouxo=True
+    )
+
+    filtrados: list[dict] = []
+    for d in nao_imp:
+        qtd = int(d.get("quantidade") or 1)
+        ref = (d.get("referencia_site") or d.get("referencia") or "").strip()
+        base = _nucleo_base_ref(ref)
+        if base and imp_nucleo.get(base, 0) >= qtd:
+            imp_nucleo[base] -= qtd
+            continue
+        fake = ItemPedido(
+            quantidade=qtd,
+            referencia_original=ref,
+            referencia=ref,
+            preco_unitario=float(d.get("preco_unitario") or 0),
+            preco_total=float(d.get("preco_total") or 0),
+        )
+        kf = _chave_conferencia_frouxa(fake)
+        if kf and bag_frouxa.get(kf, 0) >= qtd:
+            bag_frouxa[kf] -= qtd
+            continue
+        filtrados.append(d)
+    return filtrados
+
+
+def _chave_conferencia_item(item: ItemPedido) -> str:
+    """Chave para comparar linhas do site com o que a extensão leu."""
+    if item.sku:
+        return f"SKU:{item.sku.upper().strip()}"
+    if item.numero and item.total:
+        pu = round(float(item.preco_unitario or 0), 2)
+        rar = (item.raridade or "").strip().upper()
+        return f"PKM:{item.numero}/{item.total}|{pu}|{rar}"
+    ref = (item.referencia_original or item.referencia or "").upper().strip()
+    pu = round(float(item.preco_unitario or 0), 2)
+    rar = (item.raridade or "").strip().upper()
+    return f"{ref}|{pu}|{rar}"
+
+
+def _chave_conferencia_frouxa(item: ItemPedido) -> str:
+    """Mesma ref/preço, ignorando raridade (fallback)."""
+    if item.sku:
+        return f"SKU:{item.sku.upper().strip()}"
+    if item.numero and item.total:
+        pu = round(float(item.preco_unitario or 0), 2)
+        return f"PKM:{item.numero}/{item.total}|{pu}"
+    ref = (item.referencia_original or item.referencia or "").upper().strip()
+    pu = round(float(item.preco_unitario or 0), 2)
+    return f"{ref}|{pu}"
+
+
+def _bag_itens_conferencia(
+    itens: list[ItemPedido],
+    *,
+    frouxo: bool = False,
+) -> tuple[Counter, dict[str, ItemPedido]]:
+    bag: Counter = Counter()
+    exemplos: dict[str, ItemPedido] = {}
+    chave_fn = _chave_conferencia_frouxa if frouxo else _chave_conferencia_item
+    for it in itens:
+        k = chave_fn(it)
+        bag[k] += int(it.quantidade or 1)
+        exemplos.setdefault(k, it)
+    return bag, exemplos
+
+
+def _clonar_item_qtd(base: ItemPedido, qtd: int) -> ItemPedido:
+    qtd = max(int(qtd), 1)
+    pu = float(base.preco_unitario or 0)
+    return ItemPedido(
+        quantidade=qtd,
+        referencia_original=base.referencia_original,
+        referencia=base.referencia,
+        preco_unitario=pu,
+        preco_total=round(pu * qtd, 2),
+        descricao=base.descricao,
+        idioma=base.idioma,
+        raridade=base.raridade,
+        sku=base.sku,
+        reprint=base.reprint,
+        jogo=base.jogo,
+        numero=base.numero,
+        total=base.total,
+        colecao=base.colecao,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Conferência importado vs site — chaves de itens e filtro de falsos positivos
+# ---------------------------------------------------------------------------
+
+def _extrair_itens_conferencia(
+    fonte_itens: str,
+    bloco_itens: str,
+    html: str | None = None,
+) -> list[ItemPedido]:
+    """Todos os itens visíveis no texto do pedido (sem deduplicar por ref)."""
+    selados = _extrair_itens_selados_prefixo(fonte_itens, html)
+    bloco_cartas = _bloco_cartas_apos_cabecalho(fonte_itens, bloco_itens)
+    cartas = _extrair_itens_bloco(
+        bloco_cartas or bloco_itens,
+        html=html,
+        somente_cartas=True,
+        deduplicar_ref=False,
+    )
+    return selados + cartas
+
+
+def _qtd_subtotais_bloco(bloco: str) -> int:
+    return sum(
+        1
+        for lin in (bloco or "").split("\n")
+        if re.search(r"subtotal", lin, re.I)
+    )
+
+
+def _montar_item_bloco_fallback(
+    bloco_linhas: list[str],
+    offset: int,
+    linhas: list[str],
+    html: str | None = None,
+) -> ItemPedido | None:
+    """Item mínimo a partir de um bloco com subtotal (quando o parser completo falha)."""
+    sub_bloco = "\n".join(bloco_linhas)
+    parsed = _extrair_itens_bloco(
+        sub_bloco, html=html, deduplicar_ref=False, somente_cartas=False
+    )
+    if parsed:
+        return parsed[0]
+
+    ctx = "\n".join(bloco_linhas)
+    refs: list[str] = []
+    for lin in bloco_linhas:
+        for m in REF_COM_HASH.finditer(lin):
+            norm = normalizar_referencia_site(m.group(0))
+            if norm and norm not in refs:
+                refs.append(norm)
+
+    m_pkm = re.search(r"#?\s*(\d{1,3})\s*/\s*(\d{1,3})\b", ctx)
+    sku = _extrair_sku_bloco(bloco_linhas, html=html)
+    if not refs and not m_pkm and not sku:
+        return None
+
+    pt = 0.0
+    for lin in reversed(bloco_linhas):
+        if re.search(r"subtotal", lin, re.I):
+            vals = re.findall(r"R\$\s*([\d.,]+)", lin)
+            if vals:
+                pt = _parse_moeda(vals[-1])
+            break
+
+    qtd = 1
+    mq = re.search(r"(\d+)\s*x\b", ctx, re.I)
+    if mq:
+        qtd = max(int(mq.group(1)), 1)
+
+    pu = round(pt / qtd, 2) if qtd > 0 and pt > 0 else 0.0
+    if pt <= 0 and pu > 0:
+        pt = round(pu * qtd, 2)
+
+    descricao = re.sub(r"\(#.*?\)", "", bloco_linhas[0] if bloco_linhas else "")
+    descricao = re.sub(r"^\d+\s*x\s*", "", descricao, flags=re.I).strip()[:80]
+
+    if sku:
+        return ItemPedido(
+            quantidade=qtd,
+            referencia_original=sku,
+            referencia=sku,
+            preco_unitario=pu,
+            preco_total=pt or round(pu * qtd, 2),
+            descricao=descricao or sku,
+            sku=sku,
+        )
+
+    if m_pkm and not refs:
+        numero = str(int(m_pkm.group(1)))
+        total = str(int(m_pkm.group(2)))
+        ref = f"PKM-{numero}/{total}"
+        return ItemPedido(
+            quantidade=qtd,
+            referencia_original=ref,
+            referencia=ref,
+            preco_unitario=pu,
+            preco_total=pt or round(pu * qtd, 2),
+            descricao=descricao,
+            numero=numero,
+            total=total,
+            jogo="pokemon",
+        )
+
+    ref = refs[0]
+    idioma = _idioma_sigla_bloco(bloco_linhas) or _idioma_da_linha(ctx)
+    raridade = _extrair_raridade_bloco(ctx)
+    reprint = _extrair_reprint_bloco(ctx)
+    ref_conv = montar_referencia_clipp(
+        ref, idioma, raridade=raridade, reprint=reprint
+    )
+    return ItemPedido(
+        quantidade=qtd,
+        referencia_original=ref,
+        referencia=ref_conv,
+        preco_unitario=pu,
+        preco_total=pt or round(pu * qtd, 2),
+        descricao=descricao,
+        idioma=idioma,
+        raridade=raridade,
+        reprint=reprint,
+    )
+
+
+def _extrair_itens_site_por_subtotais(
+    fonte_itens: str,
+    bloco_itens: str,
+    html: str | None = None,
+) -> list[ItemPedido]:
+    """Um item por linha de subtotal — espelha o contador «N ITENS - PEDIDO»."""
+    bloco = _truncar_bloco_itens(bloco_itens or fonte_itens)
+    linhas = [l.strip() for l in bloco.split("\n") if l.strip()]
+    itens: list[ItemPedido] = []
+    for bloco_lin, offset in _iter_blocos_item(linhas):
+        if not any(re.search(r"subtotal", l, re.I) for l in bloco_lin):
+            continue
+        item = _montar_item_bloco_fallback(bloco_lin, offset, linhas, html)
+        if item:
+            itens.append(item)
+    return itens
+
+
+def _extrair_itens_site_conferencia(
+    fonte_itens: str,
+    bloco_itens: str,
+    html: str | None = None,
+    resumo: dict | None = None,
+) -> list[ItemPedido]:
+    """Lista esperada no site — prioriza contagem por subtotais quando há lacuna."""
+    site_itens = _extrair_itens_conferencia(fonte_itens, bloco_itens, html)
+    bloco = bloco_itens or fonte_itens
+    qtd_hdr = int((resumo or {}).get("qtd_cartas_site") or 0)
+    qtd_sub = _qtd_subtotais_bloco(bloco)
+    alvo = qtd_hdr or qtd_sub
+    qtd_site = sum(int(it.quantidade or 0) for it in site_itens if not it.sku)
+    if alvo and alvo > qtd_site:
+        por_sub = _extrair_itens_site_por_subtotais(fonte_itens, bloco_itens, html)
+        qtd_sub_itens = sum(int(it.quantidade or 0) for it in por_sub if not it.sku)
+        if qtd_sub_itens >= qtd_site:
+            site_itens = por_sub
+    return site_itens
+
+
+def _serializar_item_relatorio(item: ItemPedido) -> dict:
+    return {
+        "quantidade": int(item.quantidade or 0),
+        "referencia": (item.referencia or "").strip(),
+        "referencia_site": (item.referencia_original or item.referencia or "").strip(),
+        "descricao": (item.descricao or "").strip(),
+        "preco_unitario": round(float(item.preco_unitario or 0), 2),
+        "preco_total": round(float(item.preco_total or 0), 2),
+        "idioma": item.idioma,
+        "raridade": item.raridade,
+        "sku": item.sku,
+        "motivo": getattr(item, "_motivo_relatorio", None),
+    }
+
+
+def _selecionar_por_valor_faltante(
+    candidatos: list[ItemPedido],
+    diff_val: float,
+    max_qtd: int,
+) -> list[ItemPedido]:
+    """Escolhe cartas cujo preço soma ≈ diff_val (até max_qtd unidades)."""
+    if diff_val <= 0.02 or not candidatos:
+        return []
+    restante = round(diff_val, 2)
+    escolhidos: list[ItemPedido] = []
+    usados: set[int] = set()
+    ordenados = sorted(
+        candidatos,
+        key=lambda it: float(it.preco_total or it.preco_unitario or 0),
+        reverse=True,
+    )
+    for _ in range(max(max_qtd, 1)):
+        if restante <= 0.02:
+            break
+        melhor_i: int | None = None
+        melhor_dist = 999999.0
+        for i, it in enumerate(ordenados):
+            if i in usados:
+                continue
+            pt = float(it.preco_total or 0) or float(it.preco_unitario or 0)
+            if pt <= 0:
+                continue
+            dist = abs(pt - restante)
+            if dist < melhor_dist:
+                melhor_dist = dist
+                melhor_i = i
+        if melhor_i is None:
+            break
+        it = ordenados[melhor_i]
+        usados.add(melhor_i)
+        pt = float(it.preco_total or 0) or float(it.preco_unitario or 0)
+        if melhor_dist > max(0.15, restante * 0.05):
+            break
+        escolhidos.append(_clonar_item_qtd(it, 1))
+        restante = round(restante - pt, 2)
+    if escolhidos and restante <= max(0.15, diff_val * 0.02):
+        return escolhidos
+    return []
+
+
+def _gap_qtd_cartas(resumo: dict | None, lidos: list[ItemPedido]) -> int | None:
+    qtd_site = (resumo or {}).get("qtd_cartas_site")
+    if not qtd_site:
+        return None
+    qtd_lido = sum(it.quantidade for it in lidos if not it.sku)
+    return max(int(qtd_site) - int(qtd_lido), 0)
+
+
+def _sanear_faltantes_detectados(
+    faltantes: list[ItemPedido],
+    resumo: dict | None,
+    lidos: list[ItemPedido],
+) -> list[ItemPedido]:
+    if not faltantes:
+        return []
+    gap = _gap_qtd_cartas(resumo, lidos)
+    if gap is None:
+        return faltantes
+    qtd_falt = sum(int(it.quantidade or 0) for it in faltantes)
+    if qtd_falt <= 0 or qtd_falt > gap:
+        return []
+    return faltantes
+
+
+def _detectar_itens_nao_lidos(
+    lidos: list[ItemPedido],
+    fonte_itens: str,
+    bloco_itens: str,
+    html: str | None = None,
+    resumo: dict | None = None,
+    site_itens: list[ItemPedido] | None = None,
+) -> list[ItemPedido]:
+    """Cartas que constam no pedido (texto/HTML) mas não foram importadas."""
+    if site_itens is None:
+        site_itens = _extrair_itens_site_conferencia(
+            fonte_itens, bloco_itens, html, resumo
+        )
+    if not site_itens:
+        return []
+
+    def diff(bag_lidos: Counter, ex_lidos: dict, bag_site: Counter, ex_site: dict):
+        faltantes: list[ItemPedido] = []
+        for k, q_site in bag_site.items():
+            q_lido = bag_lidos.get(k, 0)
+            if q_site > q_lido:
+                faltantes.append(_clonar_item_qtd(ex_site[k], q_site - q_lido))
+        return _sanear_faltantes_detectados(faltantes, resumo, lidos)
+
+    cartas_lidas = [it for it in lidos if not it.sku]
+    cartas_site = [it for it in site_itens if not it.sku]
+
+    if cartas_lidas and cartas_site:
+        bag_ln, ex_ln = _bag_nucleo_conferencia(cartas_lidas)
+        bag_sn, ex_sn = _bag_nucleo_conferencia(cartas_site)
+        faltantes = diff(bag_ln, ex_ln, bag_sn, ex_sn)
+        if faltantes:
+            return faltantes
+
+    if cartas_lidas and cartas_site:
+        bag_l3, ex_l3 = _bag_itens_conferencia(cartas_lidas, frouxo=True)
+        bag_s3, ex_s3 = _bag_itens_conferencia(cartas_site, frouxo=True)
+        faltantes = diff(bag_l3, ex_l3, bag_s3, ex_s3)
+        if faltantes:
+            return faltantes
+
+    bag_l2, ex_l2 = _bag_itens_conferencia(lidos, frouxo=True)
+    bag_s2, ex_s2 = _bag_itens_conferencia(site_itens, frouxo=True)
+    faltantes = diff(bag_l2, ex_l2, bag_s2, ex_s2)
+    if faltantes:
+        return faltantes
+
+    bag_l, ex_l = _bag_itens_conferencia(lidos)
+    bag_s, ex_s = _bag_itens_conferencia(site_itens)
+    faltantes = diff(bag_l, ex_l, bag_s, ex_s)
+    if faltantes:
+        return faltantes
+
+    # Fallback por valor total faltante (várias cartas ou preço alto).
+    prod_site = round(float((resumo or {}).get("valor_itens") or 0), 2)
+    if prod_site <= 0:
+        m_itens = re.search(
+            r"Valor\s+dos\s+Itens[^\d]*R\$\s*([\d.,]+)",
+            fonte_itens,
+            re.I,
+        )
+        if m_itens:
+            prod_site = round(_parse_moeda(m_itens.group(1)), 2)
+    prod_lido = round(
+        sum(float(it.preco_total or 0) for it in lidos if not it.sku), 2
+    )
+    diff_val = round(prod_site - prod_lido, 2) if prod_site else 0.0
+    gap = _gap_qtd_cartas(resumo, lidos) or 0
+    if diff_val <= 0.02:
+        return []
+
+    candidatos: list[ItemPedido] = []
+    for it in cartas_site or site_itens:
+        k = _chave_conferencia_frouxa(it)
+        q_site = int(it.quantidade or 1)
+        q_lido = bag_l2.get(k, 0)
+        if q_site > q_lido:
+            candidatos.append(_clonar_item_qtd(it, q_site - q_lido))
+
+    if gap:
+        sel = _selecionar_por_valor_faltante(candidatos, diff_val, gap)
+        if sel:
+            saneado = _sanear_faltantes_detectados(sel, resumo, lidos)
+            return saneado or sel
+
+    melhor: ItemPedido | None = None
+    melhor_dist = 999999.0
+    tol = max(0.15, diff_val * 0.02)
+    for it in candidatos or (cartas_site or site_itens):
+        pt = float(it.preco_total or 0) or float(it.preco_unitario or 0)
+        if pt <= 0:
+            continue
+        dist = abs(pt - diff_val)
+        if dist < melhor_dist:
+            melhor_dist = dist
+            melhor = it
+    if melhor and melhor_dist <= tol:
+        cand = [_clonar_item_qtd(melhor, 1)]
+        saneado = _sanear_faltantes_detectados(cand, resumo, lidos)
+        return saneado or cand
+    return []
+
+
+def montar_relatorio_conferencia(
+    pedido: PedidoExtraido,
+    fonte_itens: str,
+    bloco_itens: str,
+    html: str | None,
+    *,
+    id_venda: int | None = None,
+    itens_sem_estoque: list | None = None,
+) -> dict:
+    """Relatório importado vs site para exibir na extensão (nova aba)."""
+    site_itens = _extrair_itens_site_conferencia(
+        fonte_itens, bloco_itens, html, pedido.resumo
+    )
+    nao_lidos = pedido.resumo.get("itens_nao_lidos") or []
+    if not nao_lidos:
+        nao_lidos = _detectar_itens_nao_lidos(
+            pedido.itens,
+            fonte_itens,
+            bloco_itens,
+            html,
+            pedido.resumo,
+            site_itens=site_itens,
+        )
+
+    importados = [_serializar_item_relatorio(it) for it in pedido.itens]
+    site_ser = [_serializar_item_relatorio(it) for it in site_itens]
+    nao_imp: list[dict] = []
+    for it in nao_lidos:
+        d = _serializar_item_relatorio(it)
+        d["motivo"] = "nao_lida"
+        nao_imp.append(d)
+
+    sem_est: list[dict] = []
+    for f in itens_sem_estoque or []:
+        if hasattr(f, "as_dict"):
+            d = f.as_dict()
+        elif isinstance(f, dict):
+            d = dict(f)
+        else:
+            continue
+        d["motivo"] = "sem_estoque"
+        sem_est.append(d)
+        nao_imp.append(
+            {
+                "quantidade": d.get("quantidade", 1),
+                "referencia": d.get("referencia") or d.get("referencia_site") or "?",
+                "referencia_site": d.get("referencia_site") or d.get("referencia"),
+                "descricao": d.get("descricao") or "",
+                "preco_unitario": d.get("preco_unitario", 0),
+                "preco_total": d.get("preco_total")
+                or round(
+                    float(d.get("preco_unitario") or 0)
+                    * int(d.get("quantidade") or 1),
+                    2,
+                ),
+                "idioma": d.get("idioma"),
+                "raridade": d.get("raridade"),
+                "sku": d.get("sku"),
+                "motivo": "sem_estoque",
+            }
+        )
+
+    qtd_site = int(pedido.resumo.get("qtd_cartas_site") or 0)
+    if not qtd_site:
+        qtd_site = sum(int(it.quantidade or 0) for it in site_itens if not it.sku)
+    qtd_imp = sum(int(it.quantidade or 0) for it in pedido.itens if not it.sku)
+    val_site = round(float(pedido.resumo.get("valor_itens") or 0), 2)
+    val_imp = round(
+        sum(float(it.preco_total or 0) for it in pedido.itens if not it.sku), 2
+    )
+
+    if not nao_imp and qtd_site > qtd_imp:
+        bag_i, _ = _bag_itens_conferencia(
+            [it for it in pedido.itens if not it.sku], frouxo=True
+        )
+        bag_s, ex_s = _bag_itens_conferencia(
+            [it for it in site_itens if not it.sku], frouxo=True
+        )
+        for k, q_site in bag_s.items():
+            q_i = bag_i.get(k, 0)
+            if q_site > q_i:
+                d = _serializar_item_relatorio(
+                    _clonar_item_qtd(ex_s[k], q_site - q_i)
+                )
+                d["motivo"] = "nao_lida"
+                nao_imp.append(d)
+
+    nao_imp = _filtrar_falsos_positivos_relatorio(pedido.itens, nao_imp)
+
+    return {
+        "numero_pedido": pedido.numero_pedido,
+        "id_venda": id_venda,
+        "cliente_nome": pedido.cliente.get("nome"),
+        "conferencia": {
+            "qtd_site": qtd_site,
+            "qtd_importada": qtd_imp,
+            "valor_site": val_site,
+            "valor_importado": val_imp,
+            "avisos": pedido.resumo.get("avisos_conferencia") or [],
+        },
+        "itens_importados": importados,
+        "itens_site": site_ser,
+        "itens_nao_importados": nao_imp,
+        "itens_sem_estoque": sem_est,
+        "subtotal_pendente": round(
+            sum(float(x.get("preco_total") or 0) for x in nao_imp), 2
+        ),
+    }
+
+
+def _registrar_itens_nao_lidos(
+    pedido: PedidoExtraido,
+    fonte_itens: str,
+    bloco_itens: str,
+    html: str | None,
+) -> None:
+    site_itens = _extrair_itens_site_conferencia(
+        fonte_itens, bloco_itens, html, pedido.resumo
+    )
+    pedido.resumo["itens_site_conferencia"] = site_itens
+    nao_lidos = _detectar_itens_nao_lidos(
+        pedido.itens,
+        fonte_itens,
+        bloco_itens,
+        html,
+        pedido.resumo,
+        site_itens=site_itens,
+    )
+    if not nao_lidos:
+        return
+    pedido.resumo["itens_nao_lidos"] = nao_lidos
+    for it in nao_lidos:
+        ref = it.referencia_original or it.referencia or it.sku or "?"
+        nome = (it.descricao or "").strip()
+        extra = f" | {nome}" if nome and nome.upper() not in str(ref).upper() else ""
+        pedido.erros.append(
+            f"AVISO: Carta não lida pela extensão: qtd={it.quantidade} "
+            f"{ref}{extra} | R$ {float(it.preco_unitario or 0):.2f} un."
+        )
+
+
+def montar_itens_extensao(itens_raw: list[dict] | None) -> list[ItemPedido]:
+    """Constrói itens diretamente da extração estruturada do DOM (extensão).
+
+    Cada item já vem isolado do bloco da carta no site (ref, qtd, preços,
+    idioma, raridade, reprint, sku), eliminando o vazamento entre cartas que
+    o parsing por texto sofria.
+    """
+    itens: list[ItemPedido] = []
+    for raw in itens_raw or []:
+        if not isinstance(raw, dict):
+            continue
+        ref = str(raw.get("referencia") or raw.get("referencia_original") or "").strip().upper()
+        sku = str(raw.get("sku") or "").strip().upper() or None
+        numero = str(raw.get("numero") or "").strip() or None
+        total = str(raw.get("total") or "").strip() or None
+        if not ref and (numero and total):
+            ref = f"{numero}/{total}"
+        if not ref and not sku:
+            continue
+        qtd = int(raw.get("quantidade") or 0)
+        preco_unit = float(raw.get("preco_unitario") or raw.get("preco") or 0)
+        preco_total = float(raw.get("preco_total") or 0)
+        if qtd <= 0 and preco_unit > 0 and preco_total > 0:
+            qtd = _inferir_quantidade_preco(1, preco_unit, preco_total)
+        if qtd <= 0:
+            qtd = 1
+        if preco_total <= 0 and preco_unit > 0:
+            preco_total = round(preco_unit * qtd, 2)
+        elif preco_unit <= 0 and preco_total > 0 and qtd > 0:
+            preco_unit = round(preco_total / qtd, 2)
+        idioma = str(raw.get("idioma") or "").strip().upper() or None
+        raridade = str(raw.get("raridade") or "").strip() or None
+        ref_orig = str(raw.get("referencia_original") or ref or sku or "").strip().upper()
+        jogo = str(raw.get("jogo") or "").strip().lower() or None
+        colecao = str(raw.get("colecao") or "").strip() or None
+        nome = str(raw.get("nome") or raw.get("descricao") or "").strip()
+        if (numero and total) and not jogo:
+            jogo = "pokemon"
+        itens.append(
+            ItemPedido(
+                quantidade=qtd,
+                referencia_original=ref_orig,
+                referencia=ref or sku,
+                preco_unitario=preco_unit,
+                preco_total=preco_total or round(preco_unit * qtd, 2),
+                descricao=(nome or str(raw.get("descricao") or ""))[:60],
+                idioma=idioma,
+                raridade=raridade,
+                sku=sku,
+                reprint=bool(raw.get("reprint")),
+                jogo=jogo,
+                numero=numero,
+                total=total,
+                colecao=colecao,
+            )
+        )
+    return itens
+
+
+# ---------------------------------------------------------------------------
+# Parser principal — HTML da extensão Chrome → PedidoExtraido
+# ---------------------------------------------------------------------------
 
 def parsear_html_pedido(
     html: str,
@@ -504,6 +1423,9 @@ def parsear_html_pedido(
     texto_pagina: str | None = None,
     *,
     idiomas_por_ref: dict | None = None,
+    selados_extensao: list[dict] | None = None,
+    reprints_por_ref: dict | None = None,
+    itens_extensao: list[dict] | None = None,
 ) -> PedidoExtraido:
     """Converte HTML/texto da página admin em PedidoExtraido."""
     html_proc = _preservar_marcadores_html(html or "")
@@ -584,8 +1506,21 @@ def parsear_html_pedido(
             if bloco_itens_html
             else (texto[texto.find("Itens do Pedido") :] if "Itens do Pedido" in texto else texto)
         )
-    pedido.itens = _extrair_itens_bloco(bloco_itens, html=html_proc)
-    aplicar_idiomas_site(pedido, idiomas_por_ref)
+    if itens_extensao:
+        # Fonte primária: itens estruturados extraídos do DOM pela extensão.
+        # Já trazem idioma/raridade/reprint por carta — não reaplicar os mapas
+        # heurísticos (que podiam vazar entre cartas).
+        pedido.itens = montar_itens_extensao(itens_extensao)
+        aplicar_selados_extensao(pedido, selados_extensao)
+        _filtrar_itens_fora_do_pedido(pedido, fonte_itens)
+    else:
+        # Fallback: parsing por texto/HTML no servidor (método anterior).
+        pedido.itens = _extrair_itens_pedido(fonte_itens, bloco_itens, html=html_proc)
+        n_ext = aplicar_selados_extensao(pedido, selados_extensao)
+        if not n_ext:
+            _completar_selados_faltantes_html(pedido, fonte_itens, html_proc)
+        aplicar_idiomas_site(pedido, idiomas_por_ref)
+        aplicar_reprints_site(pedido, reprints_por_ref)
 
     _extrair_resumo_valores_pedido(texto, pedido)
 
@@ -596,7 +1531,15 @@ def parsear_html_pedido(
     if total and produtos and "valor_frete" not in pedido.resumo:
         pedido.resumo["valor_frete"] = round(max(total - produtos, 0), 2)
 
-    _validar_totais_pedido_site(pedido, bloco_itens)
+    _validar_totais_pedido_site(pedido, fonte_itens)
+
+    if itens_extensao:
+        _registrar_itens_nao_lidos(pedido, fonte_itens, bloco_itens, html_proc)
+
+    pedido.resumo["ctx_conferencia"] = {
+        "fonte_itens": fonte_itens,
+        "bloco_itens": bloco_itens,
+    }
 
     if not pedido.cliente.get("nome"):
         pedido.erros.append("Cliente não identificado na página.")
@@ -674,6 +1617,7 @@ def _validar_totais_pedido_site(pedido: PedidoExtraido, bloco_itens: str) -> Non
             f"Quantidade: site declara {qtd_site} cartas, parser leu {qtd_parse} "
             f"(diferença {qtd_site - qtd_parse})."
         )
+        pedido.resumo["qtd_cartas_site"] = qtd_site
     if prod_site and abs(prod_site - prod_parse) > 0.02:
         avisos.append(
             f"Valor dos itens: site R$ {prod_site:.2f}, parser R$ {prod_parse:.2f} "
@@ -760,33 +1704,78 @@ def _refs_candidatas_bloco(linhas_bloco: list[str]) -> list[tuple[str, bool]]:
     return candidatas
 
 
-def _extrair_sku_bloco(linhas_bloco: list[str]) -> str | None:
+def _extrair_sku_bloco(
+    linhas_bloco: list[str], html: str | None = None
+) -> str | None:
     """Produto selado: linha «SKU: …» abaixo do item (ref = TB_EST_PRODUTO_2.REFERENCIA)."""
+    contexto = "\n".join(linhas_bloco)
+    sku = extrair_sku_texto(contexto)
+    if sku:
+        return sku
+
     for i, lin in enumerate(linhas_bloco):
-        m = re.search(r"\bSKU\s*:\s*(\S+)", lin, re.I)
+        m = re.search(r"\bSKU\s*[:\-]?\s*(\S+)", lin, re.I)
         if m:
-            return m.group(1).strip().upper()
+            cand = m.group(1).strip().upper()
+            if eh_sku_selado(cand):
+                return cand
         m = re.match(r"^\s*SKU\s+(\S+)\s*$", lin, re.I)
         if m:
-            return m.group(1).strip().upper()
+            cand = m.group(1).strip().upper()
+            if eh_sku_selado(cand):
+                return cand
         if re.match(r"^\s*SKU\s*$", lin, re.I) and i + 1 < len(linhas_bloco):
             prox = linhas_bloco[i + 1].strip()
             if prox and not re.search(r"\b(?:subtotal|unid\.|c[oó]digo)\b", prox, re.I):
-                return prox.upper()
+                cand = prox.upper()
+                if eh_sku_selado(cand):
+                    return cand
         if not re.search(r"\bc[oó]digo\b", lin, re.I):
+            m_sku = SKU_SITE_PADRAO.search(lin.upper())
+            if m_sku and eh_sku_selado(m_sku.group(1)):
+                return m_sku.group(1).upper()
             continue
         m_cod = re.search(
-            r"(?:C[ÓO]DIGO|CODIGO)\s*:\s*([A-Z0-9][A-Z0-9\-\.]*)",
+            r"(?:C[ÓO]DIGO|CODIGO)\s*:\s*(\S+)",
             lin,
             re.I,
         )
         if not m_cod:
             continue
-        bruto = m_cod.group(1).strip()
-        if normalizar_referencia_site(bruto) or REF_PADRAO.search(bruto.upper()):
+        bruto = m_cod.group(1).strip().upper()
+        if normalizar_referencia_site(bruto) or REF_PADRAO.search(bruto):
             continue
-        return bruto.upper()
+        if eh_sku_selado(bruto):
+            return bruto
+
+    if html:
+        ctx = contexto.upper()
+        if re.search(r"(?i)\bSKU\b|LACRADO|STRUCTURE\s+DECK|\bSELADO\b", ctx):
+            trecho = _trecho_html_bloco_item(html, linhas_bloco)
+            if trecho:
+                sku = extrair_sku_texto(trecho)
+                if sku:
+                    return sku
     return None
+
+
+def _trecho_html_bloco_item(html: str, linhas_bloco: list[str]) -> str:
+    """Recorta HTML próximo ao nome/SKU do item selado."""
+    if not html or not linhas_bloco:
+        return ""
+    chaves = []
+    for lin in linhas_bloco[:6]:
+        limpa = re.sub(r"^\d+\s*x\s*", "", lin, flags=re.I).strip()
+        if len(limpa) >= 8:
+            chaves.append(limpa[:40])
+        m = SKU_SITE_PADRAO.search(lin.upper())
+        if m:
+            chaves.append(m.group(1))
+    for chave in chaves:
+        pos = html.upper().find(chave.upper())
+        if pos >= 0:
+            return html[max(0, pos - 400) : pos + 1200]
+    return ""
 
 
 def _montar_item_bloco(
@@ -798,6 +1787,7 @@ def _montar_item_bloco(
     sku: str | None = None,
     idioma: str | None = None,
     raridade: str | None = None,
+    reprint: bool = False,
 ) -> ItemPedido | None:
     if ref_original:
         idx_ref = 0
@@ -811,7 +1801,9 @@ def _montar_item_bloco(
         linha_nome = bloco_linhas[idx_ref]
         descricao = re.sub(r"\(#.*?\)", "", linha_nome)
         descricao = re.sub(r"^\d+\s*x\s*", "", descricao, flags=re.I).strip()[:60]
-        ref_conv = montar_referencia_clipp(ref_original, idioma, raridade=raridade)
+        ref_conv = montar_referencia_clipp(
+            ref_original, idioma, raridade=raridade, reprint=reprint
+        )
     elif sku:
         indice_global = offset
         for j, lin in enumerate(bloco_linhas):
@@ -859,6 +1851,7 @@ def _montar_item_bloco(
         idioma=idioma,
         raridade=raridade,
         sku=sku,
+        reprint=reprint,
     )
 
 
@@ -881,6 +1874,316 @@ def _escolher_ref_bloco(
     return candidatas[0][0]
 
 
+def _cabecalho_lista_cartas(fonte: str) -> re.Match[str] | None:
+    return re.search(r"(\d+)\s+ITENS?\s*-\s*PEDIDO", fonte or "", re.I)
+
+
+def _zona_selados_prefixo(fonte_itens: str) -> str:
+    """Trecho antes de «N ITENS - PEDIDO» — produtos selados ficam aqui no site."""
+    m = _cabecalho_lista_cartas(fonte_itens)
+    if not m:
+        return ""
+    header = m.group(0)
+    pos = fonte_itens.find(header)
+    if pos <= 0:
+        return ""
+    inicio = 0
+    for marcador in ("Confirmação de Pagamento", "Forma de Pagamento"):
+        idx = fonte_itens.rfind(marcador, 0, pos)
+        if idx >= 0:
+            inicio = max(inicio, idx + len(marcador))
+    return fonte_itens[inicio:pos].strip()
+
+
+def _bloco_cartas_apos_cabecalho(fonte_itens: str, bloco_itens: str) -> str:
+    """Lista de cartas avulsas — começa no cabeçalho «N ITENS - PEDIDO»."""
+    m = _cabecalho_lista_cartas(fonte_itens or bloco_itens)
+    if not m:
+        return bloco_itens or fonte_itens
+    header = m.group(0)
+    for fonte in (fonte_itens, bloco_itens):
+        if not fonte:
+            continue
+        pos = fonte.find(header)
+        if pos < 0:
+            continue
+        fim = len(fonte)
+        for marcador in ("Nota Fiscal", "Valor dos Itens", "Valor Total"):
+            p = fonte.find(marcador, pos)
+            if p >= 0:
+                fim = min(fim, p)
+        return fonte[pos:fim].strip()
+    return bloco_itens or fonte_itens
+
+
+def _html_zona_selados(html: str | None, fonte_itens: str) -> str:
+    if not html:
+        return ""
+    m = _cabecalho_lista_cartas(fonte_itens)
+    if not m:
+        return ""
+    hp = html.upper().find(m.group(0).upper())
+    if hp < 0:
+        return ""
+    return html[max(0, hp - 12000) : hp]
+
+
+def _bloco_parece_selado(linhas_bloco: list[str]) -> bool:
+    ctx = " ".join(linhas_bloco).upper()
+    if re.search(r"\bSKU\b|LACRADO|STRUCTURE\s+DECK|\bSELADO\b|SEALED", ctx):
+        return True
+    return bool(listar_skus_texto("\n".join(linhas_bloco)))
+
+
+def _extrair_itens_selados_prefixo(
+    fonte_itens: str, html: str | None = None
+) -> list[ItemPedido]:
+    """Produtos selados (SKU) — sempre no início do pedido, antes das cartas."""
+    zona = _zona_selados_prefixo(fonte_itens)
+    html_zona = _html_zona_selados(html, fonte_itens)
+    itens: list[ItemPedido] = []
+    chaves: set[str] = set()
+
+    if zona:
+        for item in _extrair_itens_bloco(
+            zona, html=html, somente_selados=True
+        ):
+            chave = (item.sku or item.referencia_original or "").upper()
+            if chave and chave not in chaves:
+                itens.append(item)
+                chaves.add(chave)
+
+    texto_busca = "\n".join(x for x in (zona, html_zona) if x)
+    for sku in listar_skus_texto(texto_busca):
+        if sku in chaves:
+            continue
+        item = _montar_item_selado_por_sku(sku, fonte_itens, html)
+        if item:
+            itens.append(item)
+            chaves.add(sku)
+
+    return itens
+
+
+def _extrair_itens_pedido(
+    fonte_itens: str,
+    bloco_itens: str,
+    html: str | None = None,
+) -> list[ItemPedido]:
+    """Selados (SKU) primeiro; em seguida cartas avulsas."""
+    selados = _extrair_itens_selados_prefixo(fonte_itens, html)
+    bloco_cartas = _bloco_cartas_apos_cabecalho(fonte_itens, bloco_itens)
+    cartas = _extrair_itens_bloco(
+        bloco_cartas or bloco_itens,
+        html=html,
+        somente_cartas=True,
+    )
+
+    chaves = {(it.sku or it.referencia_original or "").upper() for it in selados}
+    merged = list(selados)
+    for item in cartas:
+        chave = (item.sku or item.referencia_original or "").upper()
+        if not chave or chave in chaves:
+            continue
+        merged.append(item)
+        chaves.add(chave)
+
+    cab = _extrair_totais_cabecalho_itens(fonte_itens)
+    qtd_site = cab.get("qtd_cartas_site")
+    qtd_parse = sum(it.quantidade for it in merged)
+    if qtd_site and qtd_parse < qtd_site and not selados:
+        extras = _extrair_itens_selados_prefixo(fonte_itens, html)
+        for item in extras:
+            chave = (item.sku or item.referencia_original or "").upper()
+            if chave and chave not in chaves:
+                merged.insert(0, item)
+                chaves.add(chave)
+    return merged
+
+
+def _bloco_parse_itens_ampliado(fonte_itens: str, bloco_itens: str) -> str:
+    """
+    Inclui produtos selados acima do cabeçalho «N ITENS - PEDIDO»
+    (ficam fora do trecho «Itens do Pedido» no innerText).
+    """
+    if not fonte_itens:
+        return bloco_itens
+    m = re.search(r"(\d+)\s+ITENS?\s*-\s*PEDIDO", bloco_itens or fonte_itens, re.I)
+    if not m:
+        return bloco_itens
+    header = m.group(0)
+    pos = fonte_itens.find(header)
+    if pos < 0:
+        return bloco_itens
+    inicio = max(0, pos - 5000)
+    idx_itens = fonte_itens.rfind("Itens do Pedido", 0, pos)
+    if idx_itens >= 0:
+        antes_secao = fonte_itens[max(0, idx_itens - 3000) : idx_itens]
+        if re.search(r"(?i)\bSKU\b|lacrado|structure\s+deck|\bselado\b", antes_secao):
+            inicio = max(0, idx_itens - 3000)
+        else:
+            inicio = max(inicio, idx_itens)
+    else:
+        idx_conf = fonte_itens.rfind("Confirmação de Pagamento", 0, pos)
+        if idx_conf >= 0:
+            inicio = max(inicio, idx_conf)
+    fim = len(fonte_itens)
+    for marcador in ("Nota Fiscal", "Valor dos Itens", "Valor Total"):
+        p = fonte_itens.find(marcador, pos)
+        if p >= 0:
+            fim = min(fim, p)
+    trecho = fonte_itens[inicio:fim].strip()
+    return trecho if len(trecho) >= len(bloco_itens or "") else bloco_itens
+
+
+def _montar_item_selado_por_sku(
+    sku: str, fonte: str, html: str | None = None
+) -> ItemPedido | None:
+    """Monta item selado a partir do SKU encontrado no HTML/texto completo."""
+    sku_u = sku.strip().upper()
+    trecho = ""
+    for f in (fonte, html or ""):
+        if not f:
+            continue
+        pos = f.upper().find(sku_u)
+        if pos >= 0:
+            trecho = f[max(0, pos - 1200) : pos + 1200]
+            break
+    if not trecho:
+        return None
+
+    plano = re.sub(r"<[^>]+>", "\n", trecho)
+    linhas = [l.strip() for l in plano.split("\n") if l.strip()]
+
+    item_bloco = _extrair_itens_bloco(trecho, html=html)
+    for it in item_bloco:
+        if (it.sku or "").upper() == sku_u:
+            return it
+
+    descricao = ""
+    qtd = 1
+    for lin in linhas:
+        m = re.match(r"^(\d+)\s*x\s+", lin, re.I)
+        if m:
+            qtd = max(int(m.group(1)), 1)
+            descricao = re.sub(r"^\d+\s*x\s+", "", lin, flags=re.I).strip()[:60]
+            break
+    if not descricao:
+        for lin in linhas:
+            u = lin.upper()
+            if "STRUCTURE" in u or "DECK" in u or "LACRADO" in u:
+                descricao = lin[:60]
+                break
+
+    preco_unit = 0.0
+    preco_total = 0.0
+    for lin in linhas:
+        vals = re.findall(r"R\$\s*([\d.,]+)", lin)
+        if not vals:
+            continue
+        low = lin.lower()
+        if "unid" in low:
+            preco_unit = _parse_moeda(vals[0])
+        elif "subtotal" in low:
+            preco_total = _parse_moeda(vals[-1])
+    if preco_unit <= 0 and preco_total > 0:
+        preco_unit = preco_total
+    if preco_unit <= 0:
+        return None
+
+    if preco_total > 0:
+        qtd = _inferir_quantidade_preco(qtd, preco_unit, preco_total)
+    preco_total = round(preco_unit * qtd, 2)
+
+    return ItemPedido(
+        quantidade=qtd,
+        referencia_original=sku_u,
+        referencia=sku_u,
+        preco_unitario=preco_unit,
+        preco_total=preco_total,
+        descricao=descricao or sku_u[:60],
+        sku=sku_u,
+    )
+
+
+def _completar_selados_faltantes_html(
+    pedido: PedidoExtraido,
+    fonte_itens: str,
+    html: str | None,
+) -> None:
+    """Fallback: SKUs presentes no HTML bruto mas ausentes nos itens parseados."""
+    chaves = {
+        (it.sku or it.referencia_original or "").upper()
+        for it in pedido.itens
+        if it.sku or it.referencia_original
+    }
+    cab = _extrair_totais_cabecalho_itens(fonte_itens)
+    qtd_site = cab.get("qtd_cartas_site")
+    qtd_parse = sum(it.quantidade for it in pedido.itens)
+    if qtd_site and qtd_parse >= qtd_site:
+        return
+
+    regiao_html = html or ""
+    if html:
+        hp = html.upper().find("ITENS DO PEDIDO")
+        if hp >= 0:
+            start = max(0, hp - 80000)
+            regiao_html = html[start : hp + 200000]
+        else:
+            m = _cabecalho_lista_cartas(fonte_itens)
+            if m:
+                hp2 = html.upper().find(m.group(0).upper())
+                if hp2 >= 0:
+                    start = max(0, hp2 - 80000)
+                    regiao_html = html[start : hp2 + 5000]
+    for sku in listar_skus_texto(regiao_html + "\n" + _zona_selados_prefixo(fonte_itens)):
+        if sku in chaves:
+            continue
+        item = _montar_item_selado_por_sku(sku, fonte_itens, html)
+        if item:
+            pedido.itens.insert(0, item)
+            chaves.add(sku)
+
+
+def _completar_selados_faltantes(
+    pedido: PedidoExtraido,
+    fonte_itens: str,
+    html: str | None,
+    bloco_parse: str,
+) -> None:
+    """Inclui produtos selados (SKU) que ficaram fora dos blocos de cartas."""
+    chaves = {
+        (it.sku or it.referencia_original or "").upper()
+        for it in pedido.itens
+        if it.sku or it.referencia_original
+    }
+
+    for fonte in (bloco_parse, fonte_itens, html or ""):
+        for sku in listar_skus_texto(fonte or ""):
+            if sku in chaves:
+                continue
+            item = _montar_item_selado_por_sku(sku, fonte_itens, html)
+            if item:
+                pedido.itens.insert(0, item)
+                chaves.add(sku)
+
+    plano = re.sub(r"<[^>]+>", "\n", bloco_parse or "")
+    linhas = [l.strip() for l in plano.split("\n") if l.strip()]
+    for bloco_lin, offset in _iter_blocos_item(linhas):
+        ctx = " ".join(bloco_lin).upper()
+        if not re.search(r"LACRADO|STRUCTURE\s+DECK|\bSELADO\b", ctx):
+            continue
+        sku = _extrair_sku_bloco(bloco_lin, html=html)
+        if not sku or sku in chaves:
+            continue
+        item = _montar_item_bloco(
+            bloco_lin, offset, linhas, sku=sku
+        )
+        if item:
+            pedido.itens.insert(0, item)
+            chaves.add(sku)
+
+
 def _iter_blocos_item(linhas: list[str]):
     inicio = 0
     for i, lin in enumerate(linhas):
@@ -892,7 +2195,14 @@ def _iter_blocos_item(linhas: list[str]):
         yield linhas[inicio:], inicio
 
 
-def _extrair_itens_bloco(bloco: str, html: str | None = None) -> list[ItemPedido]:
+def _extrair_itens_bloco(
+    bloco: str,
+    html: str | None = None,
+    *,
+    somente_cartas: bool = False,
+    somente_selados: bool = False,
+    deduplicar_ref: bool = True,
+) -> list[ItemPedido]:
     bloco = _truncar_bloco_itens(bloco)
     itens: list[ItemPedido] = []
     linhas = [l.strip() for l in bloco.split("\n") if l.strip()]
@@ -902,13 +2212,27 @@ def _extrair_itens_bloco(bloco: str, html: str | None = None) -> list[ItemPedido
         contexto = " ".join(bloco_linhas)
         idioma = _idioma_sigla_bloco(bloco_linhas) or _idioma_da_linha(contexto)
         raridade = _extrair_raridade_bloco(contexto)
+        reprint = _extrair_reprint_bloco(contexto)
 
-        sku = _extrair_sku_bloco(bloco_linhas)
+        sku = None
+        if not somente_cartas:
+            parece_selado = somente_selados or _bloco_parece_selado(bloco_linhas)
+            if parece_selado:
+                sku = _extrair_sku_bloco(bloco_linhas, html=html)
+                if not sku:
+                    skus = listar_skus_texto("\n".join(bloco_linhas))
+                    sku = skus[0] if skus else None
+
         ref_original = None
-        if not sku:
+        if not sku and not somente_selados:
             candidatas = _refs_candidatas_bloco(bloco_linhas)
             if candidatas:
                 ref_original = _escolher_ref_bloco(candidatas, idioma)
+
+        if somente_selados and not sku:
+            continue
+        if somente_cartas and sku:
+            continue
 
         if html and ref_original and not sku:
             idioma = (
@@ -917,11 +2241,16 @@ def _extrair_itens_bloco(bloco: str, html: str | None = None) -> list[ItemPedido
                 or _idioma_do_html(html, ref_original)
             )
             raridade = raridade or _raridade_do_html(html, ref_original)
+            if not reprint:
+                reprint = _reprint_do_html(html, ref_original)
 
         chave = ref_original or sku
-        if not chave or chave in chaves_no_pedido:
+        if not chave:
             continue
-        chaves_no_pedido.add(chave)
+        if deduplicar_ref and chave in chaves_no_pedido:
+            continue
+        if deduplicar_ref:
+            chaves_no_pedido.add(chave)
 
         item = _montar_item_bloco(
             bloco_linhas,
@@ -931,6 +2260,7 @@ def _extrair_itens_bloco(bloco: str, html: str | None = None) -> list[ItemPedido
             sku=sku,
             idioma=idioma,
             raridade=raridade,
+            reprint=reprint,
         )
         if item:
             itens.append(item)
@@ -1150,6 +2480,10 @@ def _clicar_rotulo(
                 continue
     return False
 
+
+# ---------------------------------------------------------------------------
+# Playwright RPA — login, navegação no painel e extração por URL (importar_site)
+# ---------------------------------------------------------------------------
 
 def _navegar_menu_admin(
     page,
@@ -1609,6 +2943,10 @@ def salvar_login_interativo(
         if on_log:
             on_log("Sessão salva — próximas importações reutilizam o Chrome aberto.")
 
+
+# ---------------------------------------------------------------------------
+# API pública — extrair um pedido ou listar pendentes «Aguardando envio»
+# ---------------------------------------------------------------------------
 
 def extrair_pedido_site(
     cfg_rpa: dict,

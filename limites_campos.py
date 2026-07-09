@@ -1,5 +1,10 @@
-"""Tamanhos máximos dos campos (conforme Metadatas.txt / TB_CLIENTE)."""
+"""Tamanhos máximos dos campos do CLIPP (Metadatas.txt / TB_CLIENTE).
 
+Usado por parser_pedido, rpa_tiaocards e db ao truncar/normalizar dados
+antes de INSERT/UPDATE — evita estouro de VARCHAR no Firebird.
+"""
+
+# TB_CLIENTE e endereço de entrega
 NOME = 60
 END_CEP = 9
 END_TIPO = 15

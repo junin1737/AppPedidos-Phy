@@ -4,3 +4,4 @@ pdf2image>=1.16.0
 Pillow>=10.0.0
 pypdf>=4.0.0
 playwright>=1.40.0
+requests>=2.31.0

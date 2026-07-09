@@ -6,6 +6,7 @@ Uso:
   (ou Servidor Extensao CLIPP.bat)
 
 A extensão envia o HTML da guia atual — sem abrir outro Chrome.
+Embutido em servidor_app.py na porta configurada em [extensao].
 """
 
 from __future__ import annotations
@@ -18,8 +19,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import config as app_config
 import rpa_tiaocards as rpa
 
-VERSAO_SERVIDOR = "2026.06.06-14"
+VERSAO_SERVIDOR = "2026.06.25-1"
 
+
+# ---------------------------------------------------------------------------
+# Helpers — recarregar módulos, porta e número do pedido no payload JSON
+# ---------------------------------------------------------------------------
 
 def _modulo_importar_core():
     """Importa importador do zero (evita bytecode antigo preso no sys.modules)."""
@@ -50,6 +55,10 @@ def _extrair_numero_pedido(payload: dict) -> str | None:
     m = re.search(r"#(\d{7,9})", html[:50000])
     return m.group(1) if m else None
 
+
+# ---------------------------------------------------------------------------
+# Handler HTTP — rotas GET /ping e POST /import (CORS para extensão Chrome)
+# ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "ImportadorCLIPP/1.0"
@@ -134,9 +143,77 @@ class Handler(BaseHTTPRequestHandler):
             self._enviar_json(404, {"ok": False, "mensagem": "Use POST /import"})
             return
 
+        resolver = payload.get("resolver_produto")
+        if resolver:
+            cfg = app_config.load_config()
+            msg_cfg = app_config.mensagem_config_banco(cfg)
+            if msg_cfg:
+                self._enviar_json(503, {"ok": False, "mensagem": msg_cfg})
+                return
+            db_cfg = app_config.get_db_config(cfg)
+            logs: list[str] = []
+
+            def on_log_resolver(msg: str) -> None:
+                logs.append(msg)
+                print(msg, flush=True)
+
+            try:
+                id_venda = int(resolver.get("id_venda") or 0)
+                id_prod = int(resolver.get("id_identificador") or 0)
+                item = resolver.get("item") or {}
+            except (TypeError, ValueError):
+                self._enviar_json(
+                    400,
+                    {"ok": False, "mensagem": "resolver_produto inválido."},
+                )
+                return
+            if not id_venda or not id_prod or not item:
+                self._enviar_json(
+                    400,
+                    {
+                        "ok": False,
+                        "mensagem": "Informe id_venda, id_identificador e item.",
+                    },
+                )
+                return
+            print(
+                f"\n--- Resolver item venda #{id_venda} → produto #{id_prod} ---",
+                flush=True,
+            )
+            try:
+                core = _modulo_importar_core()
+                resultado = core.resolver_produto_faltante(
+                    db_cfg,
+                    id_venda=id_venda,
+                    item=item,
+                    id_identificador=id_prod,
+                    on_log=on_log_resolver,
+                )
+            except Exception as exc:
+                print(f"ERRO: {exc}", flush=True)
+                self._enviar_json(
+                    503,
+                    {"ok": False, "mensagem": str(exc), "logs": logs},
+                )
+                return
+            resultado["logs"] = logs
+            status = 200 if resultado.get("ok") else 422
+            self._enviar_json(status, resultado)
+            return
+
         html = payload.get("html") or ""
         texto_pagina = payload.get("texto") or payload.get("innerText") or ""
         idiomas_por_ref = payload.get("idiomas_por_ref") or payload.get("idiomas") or {}
+        selados_extensao = payload.get("selados") or payload.get("skus_selados") or []
+        reprints_por_ref = payload.get("reprints_por_ref") or payload.get("reprints") or {}
+        itens_extensao = payload.get("itens") or []
+        cliente_id_escolhido = payload.get("cliente_id_escolhido")
+        try:
+            cliente_id_escolhido = (
+                int(cliente_id_escolhido) if cliente_id_escolhido else None
+            )
+        except (TypeError, ValueError):
+            cliente_id_escolhido = None
         numero = _extrair_numero_pedido(payload)
         if not numero:
             self._enviar_json(
@@ -180,6 +257,10 @@ class Handler(BaseHTTPRequestHandler):
                 vend_cfg,
                 texto_pagina=texto_pagina,
                 idiomas_por_ref=idiomas_por_ref,
+                selados_extensao=selados_extensao,
+                reprints_por_ref=reprints_por_ref,
+                itens_extensao=itens_extensao,
+                cliente_id_escolhido=cliente_id_escolhido,
                 on_log=on_log,
             )
         except Exception as exc:
@@ -202,6 +283,10 @@ class Handler(BaseHTTPRequestHandler):
         self._enviar_json(status, resultado)
 
 
+# ---------------------------------------------------------------------------
+# Factory e entrypoints — servidor embutido na bandeja ou console isolado
+# ---------------------------------------------------------------------------
+
 def criar_servidor(host: str = "127.0.0.1", porta: int | None = None):
     """Cria ThreadingHTTPServer sem iniciar (para bandeja / serviço)."""
     cfg = app_config.load_config()
@@ -212,7 +297,7 @@ def criar_servidor(host: str = "127.0.0.1", porta: int | None = None):
         try:
             import schema_app
 
-            schema_app.garantir_schema_app_pedidos(
+            schema_app.garantir_schema_apppedidos(
                 app_config.get_db_config(cfg),
                 on_log=lambda m: print(m, flush=True),
             )

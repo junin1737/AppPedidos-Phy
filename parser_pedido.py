@@ -1,4 +1,8 @@
-"""Leitura OCR de PDFs de pedido e extração estruturada dos dados."""
+"""Leitura OCR de PDFs de pedido e extração estruturada dos dados.
+
+Pipeline: PDF → Tesseract/Poppler → texto → PedidoExtraido (cliente, itens,
+referências convertidas por idioma). Usado por aplicacao_vendas e extrator_ocr.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,11 @@ from typing import Callable
 import limites_campos as lim
 
 CNPJ_LOJA = "40918528000169"
+
+# ---------------------------------------------------------------------------
+# Padrões regex — referências de cartas (set-idioma-número) e SKUs selados
+# ---------------------------------------------------------------------------
+
 # Ex.: BLZD-EN020, RA05-EN030-UR, DR1-EN206 (setor 3–4 chars, começa com letra)
 REF_SETOR = r"[A-Z][A-Z0-9]{2,3}"
 REF_SUFIXOS_OPCIONAIS = r"(?:-[A-Z0-9]{2,12})*"
@@ -20,6 +29,8 @@ REF_COM_HASH = re.compile(
     rf"#?{REF_SETOR}-[A-Z]{{2}}\d{{2,3}}{REF_SUFIXOS_OPCIONAIS}",
     re.IGNORECASE,
 )
+SKU_SELADO_PADRAO = re.compile(r"^YG[O]?[0-9]{4,12}$", re.IGNORECASE)
+SKU_SITE_PADRAO = re.compile(r"\b(YG[O]?[0-9]{4,12})\b", re.IGNORECASE)
 REF_OCR_EN = re.compile(
     rf"({REF_SETOR})-EN[O0]?(\d{{2,3}})({REF_SUFIXOS_OPCIONAIS})",
     re.IGNORECASE,
@@ -42,6 +53,97 @@ REF_LEGADO_P = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# SKU selado — distingue produto YG/YGO de carta avulsa por referência
+# ---------------------------------------------------------------------------
+
+def eh_sku_selado(codigo: str) -> bool:
+    """Código de produto selado (ex.: YG088713 / YGO86713), não carta avulsa."""
+    u = (codigo or "").strip().upper()
+    if not u or REF_PADRAO.fullmatch(u) or normalizar_referencia_site(u):
+        return False
+    if SKU_SELADO_PADRAO.fullmatch(u):
+        return True
+    if re.match(r"^[A-Z]{2,8}[0-9]{4,12}$", u) and "-" not in u:
+        return True
+    return False
+
+
+def candidatos_sku_clipp(sku: str) -> list[str]:
+    """Variantes do SKU do site para casar com REFERENCIA no CLIPP (YG ↔ YGO)."""
+    u = (sku or "").strip().upper()
+    if not u:
+        return []
+    vistos: set[str] = set()
+    out: list[str] = []
+
+    def add(valor: str | None) -> None:
+        v = (valor or "").strip().upper()
+        if not v or v in vistos:
+            return
+        vistos.add(v)
+        out.append(v)
+
+    add(u)
+    if u.startswith("YGO"):
+        add("YG" + u[3:])
+    elif u.startswith("YG"):
+        add("YGO" + u[2:])
+
+    m = re.match(r"^YG(O?)(0*)(\d+)$", u)
+    if m:
+        _, zeros, num = m.group(1), m.group(2), m.group(3)
+        add(f"YG{num}")
+        add(f"YGO{num}")
+        if zeros:
+            add(f"YG{zeros}{num}")
+            add(f"YGO{zeros}{num}")
+
+    digits = re.sub(r"\D", "", u)
+    if len(digits) >= 5:
+        add(digits)
+        sem_zeros = digits.lstrip("0")
+        if sem_zeros:
+            add(sem_zeros)
+    return out
+
+
+def extrair_sku_texto(texto: str) -> str | None:
+    """Extrai SKU selado de um trecho de texto/HTML."""
+    skus = listar_skus_texto(texto)
+    return skus[0] if skus else None
+
+
+def listar_skus_texto(texto: str) -> list[str]:
+    """Todos os SKUs selados (YG/YGO) encontrados no texto."""
+    if not texto:
+        return []
+    plano = re.sub(r"<[^>]+>", "\n", texto)
+    vistos: set[str] = set()
+    out: list[str] = []
+
+    def add(cand: str) -> None:
+        c = (cand or "").strip().upper()
+        if c and c not in vistos and eh_sku_selado(c):
+            vistos.add(c)
+            out.append(c)
+
+    for m in re.finditer(r"\bSKU\s*[:\-]?\s*([A-Z0-9]{4,20})\b", plano, re.I):
+        add(m.group(1))
+    for m in re.finditer(
+        r"(?i)SKU[^A-Z0-9]{0,16}(YG[O]?[0-9]{4,12})",
+        plano,
+    ):
+        add(m.group(1))
+    for m in SKU_SITE_PADRAO.finditer(plano.upper()):
+        add(m.group(1))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Estruturas de dados — item de linha e pedido completo extraído do PDF/site
+# ---------------------------------------------------------------------------
+
 @dataclass
 class ItemPedido:
     quantidade: int
@@ -54,6 +156,11 @@ class ItemPedido:
     idioma: str | None = None
     raridade: str | None = None
     sku: str | None = None
+    reprint: bool = False
+    jogo: str | None = None
+    numero: str | None = None
+    total: str | None = None
+    colecao: str | None = None
 
 
 @dataclass
@@ -173,8 +280,18 @@ def _colapsar_duplicata_edicao_site(texto: str) -> str:
     return t
 
 
+def _colapsar_duplicata_rp_site(texto: str) -> str:
+    """LCKCRPLCKC-EN035 → LCKC-EN035 (código duplicado com marcador RP do site)."""
+    t = (texto or "").upper().strip().lstrip("#")
+    m = re.match(r"^([A-Z][A-Z0-9]{2,3})RP\1-(.+)$", t)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    return t
+
+
 def _normalizar_codigo_site(texto: str) -> str:
     t = _dedup_prefixo_codigo_site(texto)
+    t = _colapsar_duplicata_rp_site(t)
     t = _colapsar_duplicata_edicao_site(t)
     return _colapsar_duplicata_meio_ref(t)
 
@@ -184,6 +301,10 @@ REF_EDICAO = re.compile(
     re.IGNORECASE,
 )
 
+
+# ---------------------------------------------------------------------------
+# Normalização de referências — corrige duplicatas OCR e converte idioma [PT]/[FR]
+# ---------------------------------------------------------------------------
 
 def normalizar_referencia_site(texto: str) -> str | None:
     """
@@ -419,6 +540,10 @@ def _contexto_item(linhas: list[str], indice_cod: int) -> tuple[str | None, str 
     return ref_original, idioma, indice_cod
 
 
+# ---------------------------------------------------------------------------
+# Itens do pedido (OCR) — linhas Cod: com quantidade, preço e idioma no contexto
+# ---------------------------------------------------------------------------
+
 def _extrair_itens_pedido(linhas: list[str]) -> list[ItemPedido]:
     """Cada linha Cod: com preço vira um item (referência repetida = linhas distintas)."""
     itens: list[ItemPedido] = []
@@ -436,6 +561,7 @@ def _extrair_itens_pedido(linhas: list[str]) -> list[ItemPedido]:
         idioma = idioma or _idioma_sigla_bloco(bloco_ctx_linhas)
         idioma = idioma or _idioma_da_linha(bloco_ctx)
         raridade = _extrair_raridade_bloco(bloco_ctx)
+        reprint = _extrair_reprint_bloco(bloco_ctx)
 
         qtd = _extrair_quantidade_cod(linhas, i)
         preco_unit, preco_total = _extrair_precos_linha(linha)
@@ -449,7 +575,7 @@ def _extrair_itens_pedido(linhas: list[str]) -> list[ItemPedido]:
             preco_total = round(preco_unit * qtd, 2)
 
         ref_final = montar_referencia_clipp(
-            ref_original, idioma, raridade=raridade
+            ref_original, idioma, raridade=raridade, reprint=reprint
         )
         descricao = _extrair_descricao_item(linhas, i)
 
@@ -463,6 +589,7 @@ def _extrair_itens_pedido(linhas: list[str]) -> list[ItemPedido]:
                 descricao=descricao,
                 idioma=idioma,
                 raridade=raridade,
+                reprint=reprint,
             )
         )
 
@@ -478,6 +605,9 @@ RARIDADES_SITE = (
     "Quarter Century",
     "Collectors Rare",
     "Collector's Rare",
+    "Shatterfoil Rare",
+    "Starfoil Rare",
+    "Mosaic Rare",
     "Platinum Rare",
     "Secret Rare",
     "Super Rare",
@@ -593,6 +723,34 @@ def _raridade_do_html(html: str, ref: str | None = None) -> str | None:
     return _extrair_raridade_bloco(texto)
 
 
+def _reprint_do_html(html: str, ref: str | None = None) -> bool:
+    """Detecta «(Reprint)» do HTML, escopo do próprio item.
+
+    A coleção «… (Reprint)» vem logo após o «Código:» do item e antes do
+    «Código:» do próximo. Por isso lemos só para frente, a partir da
+    referência, parando no início do próximo item — evita vazar o reprint
+    de uma carta para a de baixo.
+    """
+    if not html or not ref:
+        return False
+    html_u = html.upper()
+    ref_u = ref.upper()
+    pos = html_u.find(ref_u)
+    if pos < 0:
+        m = REF_PADRAO.search(ref_u)
+        if m:
+            pos = html_u.find(m.group(0))
+    if pos < 0:
+        return False
+    inicio = pos + len(ref_u)
+    resto = html[inicio:]
+    # próximo item começa no próximo rótulo «Código:» (ou, na falta, limite fixo)
+    prox = re.search(r"c[óo]digo\s*:", resto, re.I)
+    fim = prox.start() if prox else min(len(resto), 1500)
+    texto = re.sub(r"<[^>]+>", " ", resto[:fim])
+    return _extrair_reprint_bloco(texto)
+
+
 def _remover_padroes_referencia(texto: str) -> str:
     """Remove códigos SET-EN### do texto antes de detectar idioma."""
     limpo = REF_PADRAO.sub(" ", texto or "")
@@ -686,6 +844,37 @@ def _normalizar_raridade(texto: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+def tokens_raridade_grupo2(raridade: str) -> list[str]:
+    """Tokens para casar raridade do site com TB_EST_GRUPO_SUB / grupo2."""
+    norm = _normalizar_raridade(raridade)
+    if not norm:
+        return []
+    vistos: set[str] = set()
+    tokens: list[str] = []
+
+    def add(valor: str) -> None:
+        v = (valor or "").strip()
+        if not v or v in vistos:
+            return
+        vistos.add(v)
+        tokens.append(v)
+
+    add(norm)
+    principal = re.split(r"[,/]", norm)[0].strip()
+    add(principal)
+    partes = principal.split()
+    if partes:
+        add(partes[0])
+    return tokens
+
+
+def _extrair_reprint_bloco(contexto: str) -> bool:
+    """Detecta edição reprint no bloco do item (ex.: «Mega Pack (Reprint)»)."""
+    if not contexto:
+        return False
+    return bool(re.search(r"\(\s*reprint\s*\)|\breprint\b", contexto, re.I))
+
+
 def _extrair_raridade_bloco(contexto: str) -> str | None:
     """Extrai raridade do site (ex.: Ultra Rare) normalizada p/ TB_EST_GRUPO_SUB."""
     if not contexto:
@@ -693,6 +882,13 @@ def _extrair_raridade_bloco(contexto: str) -> str | None:
     for nome in RARIDADES_SITE:
         if re.search(re.escape(nome), contexto, re.I):
             return _normalizar_raridade(nome)
+    m = re.search(
+        r"\b([A-Za-z]+(?:foil)?)\s+Rare(?:\s*,\s*[^,\n]+)?",
+        contexto,
+        re.I,
+    )
+    if m:
+        return _normalizar_raridade(m.group(0))
     return None
 
 
@@ -778,6 +974,10 @@ def _converter_referencia(
     return ref_original
 
 
+# ---------------------------------------------------------------------------
+# Referência CLIPP — monta código final para busca no estoque (idioma + raridade)
+# ---------------------------------------------------------------------------
+
 def montar_referencia_clipp(
     ref_original: str,
     idioma: str | None,
@@ -785,6 +985,7 @@ def montar_referencia_clipp(
     raridade: str | None = None,
     sets_grupo2: frozenset[str] | None = None,
     sets_legacy_pt_prefix: dict[str, str] | None = None,
+    reprint: bool = False,
 ) -> str:
     """Converte idioma; RA01–RA04 não ganham sufixo — raridade vai para busca por ID_GRUPO2."""
     if sets_legacy_pt_prefix is None:
@@ -798,12 +999,15 @@ def montar_referencia_clipp(
         ref_original, idioma, sets_legacy_pt_prefix=sets_legacy_pt_prefix
     )
     if set_usa_grupo2(ref, sets_grupo2):
-        return ref
-    if raridade and not re.search(r"-[A-Z0-9]{2,12}$", ref):
+        ref_out = ref
+    elif raridade and not re.search(r"-[A-Z0-9]{2,12}$", ref):
         sufixo = _sufixo_raridade_ref(raridade)
-        if sufixo:
-            return f"{ref}{sufixo}"
-    return ref
+        ref_out = f"{ref}{sufixo}" if sufixo else ref
+    else:
+        ref_out = ref
+    if reprint and ref_out and not ref_out.upper().endswith("RP"):
+        return f"{ref_out}RP"
+    return ref_out
 
 
 def _sufixo_raridade_ref(raridade: str) -> str | None:
@@ -1033,6 +1237,10 @@ def _proxima_linha_util(linhas: list[str], indice: int, limite: int = 4) -> str:
         return linha
     return ""
 
+
+# ---------------------------------------------------------------------------
+# Pipeline PDF — texto nativo, OCR Tesseract e parsear_texto → PedidoExtraido
+# ---------------------------------------------------------------------------
 
 def _extrair_texto_pdf_nativo(caminho_pdf: str) -> str:
     """Tenta ler texto embutido no PDF (muito mais rápido que OCR)."""

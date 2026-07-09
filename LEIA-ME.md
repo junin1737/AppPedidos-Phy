@@ -1,62 +1,72 @@
-# Importador de Pedidos — PDF → CLIPP (Firebird)
+# AppPedidos CLIPP
 
-Aplicação desktop em Python para importar um ou mais pedidos em PDF (LigaSegura / Tiao Cards) para `TB_NFVENDA_2` e `TB_NFV_ITEM_2`, com status **Pendente** para conferência manual.
+Integração de pedidos do **Tiao Cards / LigaSegura** com o ERP **CLIPP** (Firebird), incluindo servidor na bandeja, extensão Chrome e postagens **Correios**.
 
-## Pré-requisitos
+> Documentação completa de todos os módulos e blocos: **[DOCUMENTACAO.md](DOCUMENTACAO.md)**  
+> Comentários de bloco no código: procure por `# ---------------------------------------------------------------------------` nos `.py`.
 
-1. **Python 3.10+**
-2. **Tesseract OCR** (idioma português): https://github.com/UB-Mannheim/tesseract/wiki
-3. **Poppler** (PDF → imagem): http://blog.alivate.com.au/poppler-windows/
-4. Bibliotecas Python:
+---
 
-```bash
-pip install -r requirements.txt
-```
+## O que o projeto faz
 
-## Primeira execução
+| Módulo | Descrição |
+|--------|-----------|
+| **Servidor (bandeja)** | `servidor_app.py` — HTTP local, importação via extensão, abas Correios |
+| **Extensão Chrome** | Importa o pedido aberto no painel (sem RPA separado) |
+| **Importador PDF** | `aplicacao_vendas.py` — OCR de PDFs (fluxo legado) |
+| **Postagens Correios** | Fila de etiquetas, geração de rótulo, rastreio |
+| **Financeiro** | Valores tarifados do contrato por mês |
 
-1. Execute `Rodar Aplicacao.bat` ou `python aplicacao_vendas.py`
-2. Se o banco não estiver configurado, abrirá a tela de configuração
-3. Informe o caminho do `.FDB`, usuário e senha — salvo em **`config.ini`**
-4. Configure o caminho do **Tesseract** (e Poppler, se não estiver no PATH)
-5. Se o Python for 64-bit e o Firebird do PC for 32-bit: copie o **fbclient.dll 64-bit** para uma pasta do projeto (ex.: `lib\firebird64\`) e informe o caminho em **fbclient.dll** — **não precisa instalar** o Firebird 64 no Windows
+---
 
-## Como usar
+## Início rápido (produção)
 
-1. **Adicionar PDF(s)...** — selecione um ou vários pedidos
-2. **Ler PDFs selecionados** — OCR + extração (cliente, itens, nº pedido, pagamento)
-3. Confira o **preview** à direita (referências convertidas `[PT]` → `-PT`)
-4. **Importar para o banco** — grava venda pendente e itens
+1. Execute **`AppPedidos CLIPP.bat`** (ou instale via `instalador/` — ver `LEIA-ME-INSTALACAO.md`).
+2. Configure **`config.ini`** (banco Firebird + seção `[correios]` se usar etiquetas).
+3. Instale a extensão: `chrome://extensions` → pasta `extensao_chrome` (ver `LEIA-ME-EXTENSAO.md`).
+4. Abra o pedido no site → clique na extensão → **Importar esta página**.
+5. Confira a venda **Pendente** no gerencial CLIPP e finalize.
+
+---
+
+## Início rápido (importador PDF)
+
+1. Python 3.10+, Tesseract, Poppler — `pip install -r requirements.txt`
+2. `python aplicacao_vendas.py`
+3. Adicione PDFs → **Ler PDFs** → **Importar para o banco**
+
+---
+
+## Arquivos principais
+
+| Arquivo | Função |
+|---------|--------|
+| `servidor_app.py` | Aplicação na bandeja + abas |
+| `importar_servidor.py` | API HTTP para a extensão |
+| `importar_core.py` | Orquestra importação → Firebird |
+| `rpa_tiaocards.py` | Parser HTML do painel |
+| `parser_pedido.py` | OCR e parser de PDF |
+| `db.py` | Acesso ao Firebird |
+| `correios_api.py` | API Correios |
+| `tela_postagens.py` / `tela_financeiro.py` | Abas Correios |
+| `schema_app.py` | Migração automática do banco |
+| `config.py` | `config.ini` |
+
+---
 
 ## Regras na importação
 
 | Campo | Valor |
-|---|---|
+|-------|-------|
 | `FIM` | `Pendente` |
 | `XX_ID_CAMP` | `2` |
-| `ID_FMAPGTO` / `ID_PARCELA` | `1` (altere ao finalizar) |
-| `OBS` | Nº pedido + forma de pagamento do PDF |
-| `ID_NATOPE` | `0` |
-| `TIPO_FRETE` | `0` |
-| `ENDERECO_ENTREGA` | `S` |
-| `STATUS` | `A` |
+| `ID_FMAPGTO` / `ID_PARCELA` | `1` |
+| `OBS` | Nº pedido + forma de pagamento |
 
-**Cliente:** busca por nome exato + telefone; se PDF não tiver telefone, usa CPF/CNPJ. Cadastro incompleto é completado quando possível.
+Detalhes: [DOCUMENTACAO.md §12](DOCUMENTACAO.md#12-regras-de-negócio-na-importação) e `.cursor/rules/importacao-pedidos.mdc`.
 
-**Cartas:** referência do PDF (`BLZD-EN003`) + idioma (`[PT]`) → busca `BLZD-PT003` no estoque.
+---
 
-## Arquivos
+## Atualizar em produção
 
-| Arquivo | Função |
-|---|---|
-| `aplicacao_vendas.py` | Interface principal |
-| `parser_pedido.py` | OCR e parser do PDF |
-| `db.py` | Cliente, venda e itens no Firebird |
-| `config.py` / `config.ini` | Configuração persistente |
-| `extrator_ocr.py` | Teste de leitura via terminal |
-
-## Teste rápido no terminal
-
-```bash
-python extrator_ocr.py "C:\caminho\pedido.pdf"
-```
+Gere `instalador\dist\AppPedidosCLIPP-Update.zip` com `instalador\gerar_atualizacao.ps1`, extraia na máquina e execute `ATUALIZAR.bat`.

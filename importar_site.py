@@ -1,10 +1,8 @@
 """
-Importa pedido(s) direto do painel Tiao Cards → CLIPP.
+Importa pedido(s) direto do painel Tiao Cards → CLIPP (RPA Playwright).
 
-Uso:
-  py -3 importar_site.py --login              # 1ª vez: login + 2FA no Chrome
-  py -3 importar_site.py 11058754             # um pedido
-  py -3 importar_site.py --pendentes          # todos «Aguardando envio» na lista
+Blocos: argparse CLI → rpa.extrair_pedido_site → importar_core.importar_pedido_extraido.
+Alternativa legada à extensão Chrome (Chrome dedicado ou CDP).
 """
 
 from __future__ import annotations

@@ -1,6 +1,11 @@
 """
 AppPedidos CLIPP — servidor local com janela visual + ícone na bandeja.
 
+Responsabilidades:
+  - HTTP local (importar_servidor) para a extensão Chrome
+  - Abas Tkinter: Servidor, Postagens, Financeiro, Consulta, Embalagens
+  - Log em arquivo, início com Windows, hot-reload de módulos Python
+
 Uso:
   py -3w servidor_app.py
   ou duplo clique em «AppPedidos CLIPP» / «Servidor CLIPP (bandeja).bat»
@@ -37,6 +42,11 @@ APP_TITLE = "AppPedidos CLIPP"
 APP_ICON_ICO = APP_DIR / "app_icon.ico"
 APP_ICON_PNG = APP_DIR / "app_icon.png"
 
+# Repositório GitHub — atualização pelo botão «Atualizar do GitHub»
+GITHUB_REPO = "junin1737/AppPedidos-Phy"
+GITHUB_BRANCH = "main"
+SCRIPT_ATUALIZAR_GIT = APP_DIR / "atualizar_github.ps1"
+
 _servidor_httpd = None
 _servidor_thread: threading.Thread | None = None
 _porta = 8765
@@ -55,6 +65,10 @@ _MODULOS_RECARREGAR = (
     "schema_app",
 )
 
+
+# ---------------------------------------------------------------------------
+# Log e redirecionamento de stdout (pythonw não tem console)
+# ---------------------------------------------------------------------------
 
 class _LogStream:
     """Redireciona print do servidor HTTP para o arquivo de log (pythonw não tem console)."""
@@ -92,6 +106,10 @@ def _configurar_log() -> None:
     if sys.stderr is None or not hasattr(sys.stderr, "write"):
         sys.stderr = _LogStream(LOG_FILE)
 
+
+# ---------------------------------------------------------------------------
+# Ícone da bandeja, atalhos e início automático com o Windows
+# ---------------------------------------------------------------------------
 
 def _criar_icone_tray():
     from PIL import Image
@@ -193,6 +211,10 @@ def _garantir_atalho_area_trabalho() -> None:
         _criar_atalho(lnk, "Servidor importador Tiao Cards → CLIPP")
 
 
+# ---------------------------------------------------------------------------
+# Servidor HTTP — porta, thread em background e hot-reload dos módulos Python
+# ---------------------------------------------------------------------------
+
 def _ler_porta_config() -> int:
     try:
         import config as app_config
@@ -257,6 +279,72 @@ def _recarregar_servico_ui() -> None:
         err = _recarregar_servico()
         if err:
             _mensagem_erro_windows(APP_TITLE, err)
+
+
+def _atualizar_github_ui() -> None:
+    """Baixa a versão mais recente do GitHub, encerra o app e reinicia após copiar."""
+    if not messagebox.askyesno(
+        APP_TITLE,
+        "Atualizar do GitHub?\n\n"
+        f"Repositório: {GITHUB_REPO} ({GITHUB_BRANCH})\n\n"
+        "O aplicativo será encerrado, o código será baixado e o servidor "
+        "será aberto de novo automaticamente.\n\n"
+        "config.ini e pedidos importados não são alterados.\n\n"
+        "Depois, recarregue a extensão Chrome em chrome://extensions.",
+        parent=_janela,
+    ):
+        return
+
+    if not SCRIPT_ATUALIZAR_GIT.is_file():
+        messagebox.showerror(
+            APP_TITLE,
+            f"Script de atualização não encontrado:\n{SCRIPT_ATUALIZAR_GIT}",
+            parent=_janela,
+        )
+        return
+
+    logging.info(
+        "Atualização GitHub iniciada — repo=%s branch=%s destino=%s",
+        GITHUB_REPO,
+        GITHUB_BRANCH,
+        APP_DIR,
+    )
+
+    args = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+        str(SCRIPT_ATUALIZAR_GIT),
+        "-Destino",
+        str(APP_DIR),
+        "-Repositorio",
+        GITHUB_REPO,
+        "-Branch",
+        GITHUB_BRANCH,
+        "-AguardarSegundos",
+        "3",
+    ]
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.Popen(args, cwd=str(APP_DIR), creationflags=flags)
+    except OSError as exc:
+        logging.error("Falha ao iniciar atualização GitHub: %s", exc)
+        messagebox.showerror(APP_TITLE, f"Não foi possível iniciar a atualização:\n{exc}")
+        return
+
+    if _janela is not None:
+        _janela._lbl_status.config(text="● Atualizando do GitHub…", fg="#ef6c00")
+        _janela._lbl_detalhe.config(
+            text="Encerrando para aplicar a atualização e reiniciar…"
+        )
+        _janela.update_idletasks()
+        _janela.after(400, _sair_app)
+    else:
+        threading.Timer(0.5, _sair_app).start()
 
 
 def _limpar_controle_local_ui() -> None:
@@ -417,12 +505,16 @@ def _sair_app() -> None:
         _tray_icon.stop()
 
 
+# ---------------------------------------------------------------------------
+# Janela principal — aba Servidor (status/log) + abas Correios (notebook)
+# ---------------------------------------------------------------------------
+
 class JanelaServidor(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("620x480")
-        self.minsize(520, 400)
+        self.geometry("940x640")
+        self.minsize(720, 480)
         self.configure(bg="#f5f7fa")
 
         style = ttk.Style(self)
@@ -514,7 +606,13 @@ class JanelaServidor(tk.Tk):
             )
 
     def _montar_ui(self) -> None:
-        topo = tk.Frame(self, bg="#1565c0", padx=16, pady=14)
+        self._notebook = ttk.Notebook(self)
+        self._notebook.pack(fill="both", expand=True)
+
+        srv = tk.Frame(self._notebook, bg="#f5f7fa")
+        self._notebook.add(srv, text="  Servidor  ")
+
+        topo = tk.Frame(srv, bg="#1565c0", padx=16, pady=14)
         topo.pack(fill="x")
 
         cab = tk.Frame(topo, bg="#1565c0")
@@ -547,7 +645,7 @@ class JanelaServidor(tk.Tk):
             bg="#1565c0",
         ).pack(anchor="w", pady=(4, 0))
 
-        status = tk.Frame(self, bg="#f5f7fa", padx=16, pady=12)
+        status = tk.Frame(srv, bg="#f5f7fa", padx=16, pady=12)
         status.pack(fill="x")
 
         self._lbl_status = tk.Label(
@@ -568,7 +666,7 @@ class JanelaServidor(tk.Tk):
         )
         self._lbl_detalhe.pack(anchor="w", pady=(4, 0))
 
-        botoes = tk.Frame(self, bg="#f5f7fa", padx=16)
+        botoes = tk.Frame(srv, bg="#f5f7fa", padx=16)
         botoes.pack(fill="x", pady=(0, 8))
 
         self._btn_recarregar = ttk.Button(
@@ -577,6 +675,12 @@ class JanelaServidor(tk.Tk):
             command=self.executar_recarregar_servico,
         )
         self._btn_recarregar.pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            botoes,
+            text="Atualizar do GitHub",
+            command=_atualizar_github_ui,
+        ).pack(side="left", padx=(0, 8))
 
         ttk.Button(
             botoes,
@@ -592,7 +696,7 @@ class JanelaServidor(tk.Tk):
         ):
             ttk.Button(botoes, text=texto, command=cmd).pack(side="left", padx=(0, 8))
 
-        opcoes = tk.Frame(self, bg="#f5f7fa", padx=16)
+        opcoes = tk.Frame(srv, bg="#f5f7fa", padx=16)
         opcoes.pack(fill="x", pady=(0, 8))
 
         ttk.Checkbutton(
@@ -603,7 +707,7 @@ class JanelaServidor(tk.Tk):
         ).pack(anchor="w")
 
         tk.Label(
-            self,
+            srv,
             text="Atividade recente (importações e erros):",
             font=("Segoe UI", 9, "bold"),
             bg="#f5f7fa",
@@ -611,7 +715,7 @@ class JanelaServidor(tk.Tk):
         ).pack(anchor="w", padx=16)
 
         self._log = scrolledtext.ScrolledText(
-            self,
+            srv,
             height=14,
             font=("Consolas", 9),
             state="disabled",
@@ -629,7 +733,7 @@ class JanelaServidor(tk.Tk):
         )
         self._log.configure(state="disabled")
 
-        rodape = tk.Frame(self, bg="#eceff1", padx=16, pady=10)
+        rodape = tk.Frame(srv, bg="#eceff1", padx=16, pady=10)
         rodape.pack(fill="x")
 
         tk.Label(
@@ -643,6 +747,29 @@ class JanelaServidor(tk.Tk):
         ).pack(side="left", fill="x", expand=True)
 
         ttk.Button(rodape, text="Sair", command=self._confirmar_sair).pack(side="right")
+
+        # Aba de Gerenciamento de Postagens (Correios)
+        try:
+            from tela_postagens import (
+                ConsultaCorreiosFrame,
+                EmbalagensFrame,
+                PostagensFrame,
+            )
+            from tela_financeiro import FinanceiroFrame
+
+            self._aba_postagens = PostagensFrame(self._notebook, com_cabecalho=True)
+            self._notebook.add(self._aba_postagens, text="  Postagens (Correios)  ")
+
+            self._aba_financeiro = FinanceiroFrame(self._notebook, com_cabecalho=True)
+            self._notebook.add(self._aba_financeiro, text="  Financeiro  ")
+
+            self._aba_consulta = ConsultaCorreiosFrame(self._notebook, com_cabecalho=True)
+            self._notebook.add(self._aba_consulta, text="  Consultar Correios  ")
+
+            self._aba_embalagens = EmbalagensFrame(self._notebook, com_cabecalho=True)
+            self._notebook.add(self._aba_embalagens, text="  Embalagens  ")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Aba Postagens indisponível: %s", exc)
 
     def _toggle_inicio(self) -> None:
         ativo = self._var_inicio.get()
@@ -701,6 +828,10 @@ class JanelaServidor(tk.Tk):
             _sair_app()
 
 
+# ---------------------------------------------------------------------------
+# Menu do ícone na bandeja (abrir janela, config, pasta extensão, sair)
+# ---------------------------------------------------------------------------
+
 def _montar_menu_tray(icon):
     import pystray
 
@@ -718,6 +849,7 @@ def _montar_menu_tray(icon):
         ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Recarregar serviço", lambda *_: _recarregar_servico_ui()),
+        pystray.MenuItem("Atualizar do GitHub", lambda *_: _atualizar_github_ui()),
         pystray.MenuItem("Limpar controle local", lambda *_: _limpar_controle_local_ui()),
         pystray.MenuItem("Configurar banco (config.ini)", lambda *_: _abrir_config()),
         pystray.MenuItem("Pasta da extensão Chrome", lambda *_: _abrir_pasta_extensao()),
@@ -759,6 +891,10 @@ def _mensagem_erro_windows(titulo: str, mensagem: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Entrypoint — configura log, sobe HTTP, bandeja e janela Tkinter
+# ---------------------------------------------------------------------------
+
 def main() -> int:
     global _janela
 
@@ -785,7 +921,9 @@ def main() -> int:
             try:
                 import schema_app
 
-                schema_app.garantir_schema_app_pedidos(
+                # Agregador: cria/reconcilia TODO o schema do AppPedidos
+                # (erros, etiqueta dos Correios e embalagem) e loga no arquivo.
+                schema_app.garantir_schema_apppedidos(
                     app_config.get_db_config(app_config.load_config()),
                     on_log=logging.info,
                 )

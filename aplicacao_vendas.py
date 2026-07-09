@@ -1,5 +1,8 @@
 """
 Importador de pedidos PDF → Firebird (TB_NFVENDA_2 / TB_NFV_ITEM_2).
+
+Interface desktop legada: OCR de PDFs, preview e gravação pendente no CLIPP.
+O fluxo principal em produção é extensão Chrome + servidor_app.
 """
 
 from __future__ import annotations
@@ -12,7 +15,12 @@ from tkinter import filedialog, messagebox, ttk
 import config as app_config
 import db as firebird_db
 from parser_pedido import PedidoExtraido, extrair_pedido_pdf
+from tela_postagens import abrir_tela_postagens
 
+
+# ---------------------------------------------------------------------------
+# ConfigDialog — primeira configuração (banco Firebird, Tesseract, Poppler)
+# ---------------------------------------------------------------------------
 
 class ConfigDialog(tk.Toplevel):
     def __init__(self, parent, cfg, on_save):
@@ -216,6 +224,10 @@ class ConfigDialog(tk.Toplevel):
         self.destroy()
 
 
+# ---------------------------------------------------------------------------
+# ImportadorApp — lista PDFs, OCR, preview e importação em lote para o Firebird
+# ---------------------------------------------------------------------------
+
 class ImportadorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -245,6 +257,12 @@ class ImportadorApp:
         menu_arq.add_separator()
         menu_arq.add_command(label="Sair", command=self.root.quit)
         menubar.add_cascade(label="Arquivo", menu=menu_arq)
+
+        menu_correios = tk.Menu(menubar, tearoff=0)
+        menu_correios.add_command(
+            label="Gerenciar Postagens...", command=self._abrir_postagens
+        )
+        menubar.add_cascade(label="Correios", menu=menu_correios)
         self.root.config(menu=menubar)
 
         topo = ttk.Frame(self.root, padding=10)
@@ -264,6 +282,7 @@ class ImportadorApp:
         )
         self.btn_desfazer.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(topo, text="Limpar lista", command=self._limpar_lista).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(topo, text="Postagens (Correios)", command=self._abrir_postagens).pack(side=tk.LEFT, padx=(8, 0))
 
         self.lbl_banco = ttk.Label(topo, text="", foreground="#1565c0")
         self.lbl_banco.pack(side=tk.RIGHT)
@@ -339,6 +358,9 @@ class ImportadorApp:
         self.txt_log_import.configure(yscrollcommand=log_scroll.set)
         self.txt_log_import.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _abrir_postagens(self):
+        abrir_tela_postagens(self.root)
 
     def _mostrar_overlay_importacao(self, total_pedidos: int):
         self._import_progress_max = max(1, 1 + total_pedidos)
@@ -919,6 +941,10 @@ class ImportadorApp:
         self._set_status(f"Importação finalizada: {ok} OK, {falha} falha(s).")
         self._atualizar_btn_desfazer()
 
+
+# ---------------------------------------------------------------------------
+# Entrypoint — abre ImportadorApp (config.ini deve estar preenchido)
+# ---------------------------------------------------------------------------
 
 def main():
     root = tk.Tk()

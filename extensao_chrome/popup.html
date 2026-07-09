@@ -31,13 +31,56 @@
     .erro { color: #c5221f; }
     .aviso { color: #e37400; }
     .dica { color: #5f6368; font-size: 12px; margin-top: 8px; }
+    #versao { color: #80868b; font-size: 11px; margin: 0 0 8px; }
+    #clientes { margin-top: 10px; }
+    #clientes .titulo { font-weight: 600; margin-bottom: 6px; }
+    #produtos { margin-top: 10px; }
+    #produtos .titulo { font-weight: 600; margin-bottom: 6px; }
+    #produtos .subtitulo { color: #5f6368; font-size: 11px; margin-bottom: 6px; }
+    .cliente-item,
+    .produto-item {
+      width: 100%;
+      text-align: left;
+      padding: 8px 10px;
+      margin: 0 0 6px;
+      font-size: 12px;
+      font-weight: 500;
+      background: #f1f3f4;
+      color: #202124;
+      border: 1px solid #dadce0;
+      border-radius: 6px;
+    }
+    .cliente-item:not(:disabled):hover,
+    .produto-item:not(:disabled):hover { background: #e2e6ea; }
+    .cliente-item .nome,
+    .produto-item .nome { font-weight: 600; display: block; }
+    .cliente-item .sub,
+    .produto-item .sub { color: #5f6368; font-size: 11px; }
+    #clientes .vazio,
+    #produtos .vazio { color: #c5221f; font-size: 12px; }
+    .btn-sec {
+      width: 100%;
+      padding: 8px;
+      margin-top: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      background: #f1f3f4;
+      color: #202124;
+      border: 1px solid #dadce0;
+      border-radius: 6px;
+    }
+    .btn-sec:not(:disabled):hover { background: #e2e6ea; }
   </style>
 </head>
 <body>
   <h1>Pedido → CLIPP</h1>
+  <p id="versao"></p>
   <p class="dica">Abra o <strong>detalhe do pedido</strong> no painel (Gerenciamento de Pedidos) e clique abaixo.</p>
   <button type="button" id="btn">Importar esta página</button>
   <div id="status"></div>
+  <div id="clientes"></div>
+  <div id="produtos"></div>
   <script src="popup.js"></script>
 </body>
 </html>

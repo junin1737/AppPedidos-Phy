@@ -1,4 +1,8 @@
-"""Operações Firebird para importação de pedidos."""
+"""Operações Firebird para importação de pedidos e integração Correios.
+
+Camadas: conexão/schema, cliente, estoque, venda, etiquetas. Consumido por
+importar_core, aplicacao_vendas, tela_postagens e tela_financeiro.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +10,11 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path
 
 import fdb
@@ -22,9 +29,15 @@ from parser_pedido import (
     formatar_documento,
     linha_e_apelido_nick,
     set_usa_grupo2,
+    tokens_raridade_grupo2,
+    candidatos_sku_clipp,
     _normalizar_raridade,
 )
 
+
+# ---------------------------------------------------------------------------
+# Dataclasses — resultado de importação, itens faltantes e rollback
+# ---------------------------------------------------------------------------
 
 @dataclass
 class RegistroDesfazer:
@@ -112,6 +125,7 @@ class ResultadoImportacao:
     id_cliente: int | None = None
     mensagem: str = ""
     itens_nao_encontrados: list[ItemFaltante] | None = None
+    arquivo_faltantes: str | None = None
     desfazer: RegistroDesfazer | None = None
 
 
@@ -120,6 +134,10 @@ class ResultadoDesfazer:
     sucesso: bool
     mensagem: str
 
+
+# ---------------------------------------------------------------------------
+# Conexão Firebird — fbclient, abertura, schema automático e commit visível CLIPP
+# ---------------------------------------------------------------------------
 
 def carregar_fbclient(fbclient_path: str) -> None:
     """Carrega fbclient.dll 64-bit de uma pasta local (sem instalar Firebird no sistema)."""
@@ -165,7 +183,8 @@ def _parametros_conexao(db_config: dict) -> dict:
     return params
 
 
-def conectar(db_config: dict):
+def _abrir_conexao(db_config: dict):
+    """Abre a conexão Firebird crua (sem disparar a reconciliação de schema)."""
     carregar_fbclient(db_config.get("fbclient_path", ""))
     params = _parametros_conexao(db_config)
     try:
@@ -186,6 +205,47 @@ def conectar(db_config: dict):
                 "— assim funciona com IBExpert e o sistema abertos."
             ) from exc
         raise
+
+
+# Reconciliação de schema: roda uma vez por processo/banco (cache), na 1ª conexão.
+_schema_ok: set[str] = set()
+_schema_lock = threading.Lock()
+_schema_local = threading.local()
+
+
+def _chave_schema(db_config: dict) -> str:
+    return "|".join(
+        str(db_config.get(k, ""))
+        for k in ("host", "port", "database", "user", "servidor")
+    )
+
+
+def _garantir_schema_once(db_config: dict) -> None:
+    """Garante o schema do AppPedidos uma única vez por processo (por banco)."""
+    if getattr(_schema_local, "em_progresso", False):
+        return
+    chave = _chave_schema(db_config)
+    with _schema_lock:
+        if chave in _schema_ok:
+            return
+    _schema_local.em_progresso = True
+    try:
+        import schema_app
+
+        schema_app.garantir_schema_apppedidos(db_config)
+        with _schema_lock:
+            _schema_ok.add(chave)
+    except Exception:  # noqa: BLE001 - schema nunca pode impedir a conexão
+        pass
+    finally:
+        _schema_local.em_progresso = False
+
+
+def conectar(db_config: dict):
+    """Conecta ao Firebird e, na 1ª vez do processo, reconcilia o schema do app."""
+    con = _abrir_conexao(db_config)
+    _garantir_schema_once(db_config)
+    return con
 
 
 def encerrar_conexao(con, commit: bool = True) -> None:
@@ -392,6 +452,10 @@ def _pulso_visibilidade_clipp(
         _fechar_conexao(con)
 
 
+# ---------------------------------------------------------------------------
+# Utilitários — texto, OBS da venda, telefones e busca por documento
+# ---------------------------------------------------------------------------
+
 def _so_digitos(valor: str) -> str:
     return re.sub(r"\D", "", valor or "")
 
@@ -487,6 +551,10 @@ def _cliente_documento_confere(cur, id_cliente: int, documento: str) -> bool:
     return encontrado == int(id_cliente)
 
 
+# ---------------------------------------------------------------------------
+# Cliente — busca, listagem semelhante e candidatos para escolha manual
+# ---------------------------------------------------------------------------
+
 def buscar_cliente(cur, nome: str, telefone: str = "", documento: str = "") -> int | None:
     nome = (nome or "").strip()
     if nome.lower() in _NOMES_BLOQUEADOS:
@@ -542,8 +610,223 @@ def buscar_cliente(cur, nome: str, telefone: str = "", documento: str = "") -> i
     return None
 
 
+def _documento_do_cliente(cur, id_cliente: int) -> str:
+    """CPF/CNPJ formatado do cliente (para exibir na escolha manual)."""
+    cur.execute("SELECT TRIM(CPF) FROM TB_CLI_PF WHERE ID_CLIENTE = ?", (id_cliente,))
+    row = cur.fetchone()
+    if row and row[0]:
+        return formatar_documento(_so_digitos(row[0]))
+    cur.execute("SELECT TRIM(CNPJ) FROM TB_CLI_PJ WHERE ID_CLIENTE = ?", (id_cliente,))
+    row = cur.fetchone()
+    if row and row[0]:
+        return formatar_documento(_so_digitos(row[0]))
+    return ""
+
+
+def _tokens_nome(nome: str) -> list[str]:
+    """Tokens do nome sem acento, em maiúsculas (para comparar similaridade)."""
+    base = _sem_acento((nome or "").upper())
+    return [t for t in re.split(r"[^A-Z0-9]+", base) if len(t) >= 3]
+
+
+def buscar_clientes_por_nome(cur, nome: str, limite: int = 20) -> list[dict]:
+    """Clientes com nome parecido, ranqueados por nº de tokens em comum.
+
+    Usado na retirada no balcão, em que a página não traz CPF/CNPJ: o usuário
+    escolhe manualmente qual cliente é o correto.
+    """
+    nome = (nome or "").strip()
+    if not nome or nome.lower() in _NOMES_BLOQUEADOS:
+        return []
+    tokens = _tokens_nome(nome)
+    if not tokens:
+        return []
+
+    # Chaves de busca no banco preservam acento (UPPER(NOME) mantém acento no FB).
+    raw_tokens = [
+        t for t in re.split(r"[^0-9A-Za-zÀ-ÿ]+", nome.upper()) if len(t) >= 3
+    ]
+    chaves = {raw_tokens[0], raw_tokens[-1]} if raw_tokens else {tokens[0]}
+
+    encontrados: dict[int, tuple] = {}
+    for chave in chaves:
+        cur.execute(
+            """
+            SELECT FIRST 120 c.ID_CLIENTE, c.NOME,
+                   c.DDD_RESID, c.FONE_RESID, c.DDD_COMER, c.FONE_COMER,
+                   c.DDD_CELUL, c.FONE_CELUL
+            FROM TB_CLIENTE c
+            WHERE UPPER(c.NOME) CONTAINING ?
+            ORDER BY c.NOME
+            """,
+            (chave,),
+        )
+        for row in cur.fetchall():
+            encontrados[int(row[0])] = row
+
+    ranqueados = []
+    for cid, row in encontrados.items():
+        toks_cli = set(_tokens_nome(row[1] or ""))
+        overlap = sum(1 for t in tokens if t in toks_cli)
+        if not overlap:
+            continue
+        ranqueados.append((overlap, (row[1] or "").strip().upper(), cid, row))
+
+    ranqueados.sort(key=lambda x: (-x[0], x[1]))
+
+    saida: list[dict] = []
+    for _overlap, _nome_upper, cid, row in ranqueados[:limite]:
+        tels = sorted(_telefones_cliente(row[2:]))
+        saida.append(
+            {
+                "id_cliente": cid,
+                "nome": (row[1] or "").strip(),
+                "documento": _documento_do_cliente(cur, cid),
+                "telefone": tels[0] if tels else "",
+            }
+        )
+    return saida
+
+
+def listar_clientes_semelhantes(
+    db_config: dict, nome: str, limite: int = 20
+) -> list[dict]:
+    """Abre conexão e retorna clientes com nome parecido."""
+    con = conectar(db_config)
+    try:
+        cur = con.cursor()
+        return buscar_clientes_por_nome(cur, nome, limite=limite)
+    finally:
+        con.close()
+
+
+def buscar_produtos_semelhantes(
+    cur,
+    *,
+    descricao: str = "",
+    referencia: str = "",
+    preco_alvo: float | None = None,
+    limite: int = 15,
+) -> list[dict]:
+    """Produtos do estoque com nome/referência parecidos (escolha manual na extensão)."""
+    desc = (descricao or "").strip()
+    ref = (referencia or "").strip().upper()
+    tokens_desc = _tokens_nome(desc) if desc else []
+    tokens_ref = [
+        t
+        for t in re.split(r"[^A-Z0-9]+", ref)
+        if len(t) >= 3
+    ]
+
+    chaves: set[str] = set()
+    if tokens_desc:
+        raw = [
+            t
+            for t in re.split(r"[^0-9A-Za-zÀ-ÿ]+", desc.upper())
+            if len(t) >= 3
+        ]
+        if raw:
+            chaves.add(raw[0])
+            if len(raw) > 1:
+                chaves.add(raw[-1])
+        for t in sorted(tokens_desc, key=len, reverse=True)[:3]:
+            chaves.add(t)
+    if ref and len(ref) >= 4:
+        chaves.add(ref[:12])
+        base = ref.split("-")[0]
+        if len(base) >= 3:
+            chaves.add(base)
+    for t in tokens_ref[:3]:
+        chaves.add(t)
+
+    if not chaves:
+        return []
+
+    encontrados: dict[int, tuple] = {}
+    for chave in chaves:
+        cur.execute(
+            """
+            SELECT FIRST 80 ID_IDENTIFICADOR, PROD_SERV, PRC_VENDA,
+                   UPPER(TRIM(REFERENCIA))
+            FROM V_ESTOQUE_2
+            WHERE UPPER(PROD_SERV) CONTAINING ?
+               OR UPPER(TRIM(REFERENCIA)) CONTAINING ?
+            ORDER BY ID_IDENTIFICADOR
+            """,
+            (chave, chave),
+        )
+        for row in cur.fetchall():
+            encontrados[int(row[0])] = row
+
+    alvo_tokens = set(tokens_desc)
+    if ref:
+        alvo_tokens.update(tokens_ref)
+    ranqueados: list[tuple] = []
+    for pid, row in encontrados.items():
+        nome = str(row[1] or "").strip()
+        ref_row = str(row[3] or "").strip().upper()
+        toks_nome = set(_tokens_nome(nome))
+        overlap = sum(1 for t in alvo_tokens if t in toks_nome)
+        if ref and ref_row:
+            if ref_row == ref:
+                overlap += 8
+            elif ref in ref_row or ref_row in ref:
+                overlap += 5
+            elif any(t in ref_row for t in tokens_ref):
+                overlap += 2
+        if not overlap and not alvo_tokens:
+            continue
+        preco = float(row[2] or 0)
+        diff_preco = (
+            abs(preco - float(preco_alvo))
+            if preco_alvo and preco_alvo > 0 and preco > 0
+            else 9999.0
+        )
+        ranqueados.append((overlap, -diff_preco, nome.upper(), pid, row))
+
+    ranqueados.sort(key=lambda x: (-x[0], -x[1], x[2]))
+
+    saida: list[dict] = []
+    for _overlap, _diff, _nome, pid, row in ranqueados[:limite]:
+        saida.append(
+            {
+                "id_identificador": pid,
+                "referencia": str(row[3] or "").strip(),
+                "prod_serv": str(row[1] or "").strip()[:80],
+                "prc_venda": float(row[2] or 0),
+            }
+        )
+    return saida
+
+
+def listar_produtos_semelhantes(
+    db_config: dict,
+    *,
+    descricao: str = "",
+    referencia: str = "",
+    preco_alvo: float | None = None,
+    limite: int = 15,
+) -> list[dict]:
+    con = conectar(db_config)
+    try:
+        cur = con.cursor()
+        return buscar_produtos_semelhantes(
+            cur,
+            descricao=descricao,
+            referencia=referencia,
+            preco_alvo=preco_alvo,
+            limite=limite,
+        )
+    finally:
+        con.close()
+
+
 ID_PAIS_PADRAO = lim.ID_PAIS
 
+
+# ---------------------------------------------------------------------------
+# Cidade — resolve ID_CIDADE em TB_CIDADE_SIS (nome + UF)
+# ---------------------------------------------------------------------------
 
 def buscar_id_cidade(cur, cidade: str, uf: str) -> str | None:
     """Busca ID_CIDADE em TB_CIDADE_SIS (NOME + SIGLA_UF)."""
@@ -652,7 +935,8 @@ def _montar_linha_endereco_site(cli: dict) -> str:
 def _montar_observacao_padrao_clipp(cli: dict) -> str:
     """Bloco multilinha igual ao cadastro manual (2º print)."""
     linhas: list[str] = []
-    nome = (cli.get("nome") or "").strip()
+    # Ignora apelido/nick entre parênteses (em qualquer posição do nome).
+    nome = re.sub(r"\s*\([^)]*\)\s*", " ", (cli.get("nome") or "")).strip()
     if nome:
         linhas.append(nome)
     linha_end = _montar_linha_endereco_site(cli)
@@ -728,6 +1012,10 @@ def _preparar_complemento_e_observacao(cli: dict) -> None:
     if obs:
         cli["observacao"] = obs
 
+
+# ---------------------------------------------------------------------------
+# Endereço — normalização do site para campos TB_CLIENTE / entrega
+# ---------------------------------------------------------------------------
 
 def normalizar_endereco_cliente(cli: dict) -> None:
     """Alinha END_TIPO + END_LOGRAD; não inventa «Rua» nem mistura apelido no endereço."""
@@ -967,6 +1255,12 @@ def _garantir_cliente_pronto_clipp(cur, id_cliente: int) -> None:
         )
 
 
+def _pedido_retirada_balcao(pedido: PedidoExtraido) -> bool:
+    """Retirada no balcão: a página não traz o bloco de entrega do cliente."""
+    envio = getattr(pedido, "envio", "") or ""
+    return bool(re.search(r"retirada|balc[aã]o", envio, re.I))
+
+
 def _completar_cliente(cur, id_cliente: int, pedido: PedidoExtraido) -> dict | None:
     cli = pedido.cliente
     cur.execute(
@@ -988,34 +1282,33 @@ def _completar_cliente(cur, id_cliente: int, pedido: PedidoExtraido) -> dict | N
     if nome_pdf and _deve_atualizar_nome(nome_atual, nome_pdf):
         updates["NOME"] = nome_pdf
 
-    idx_campo = {
-        "END_CEP": 1,
-        "END_TIPO": 2,
-        "END_LOGRAD": 3,
-        "END_NUMERO": 4,
-        "END_BAIRRO": 5,
-        "END_COMPLE": 6,
-    }
-    for campo, valor in _campos_endereco_para_db(cli).items():
-        if valor:
-            updates[campo] = valor
+    # Em retirada no balcão a página não traz o endereço de entrega do cliente
+    # (vem lixo como "Nick: ..."), então só atualiza o nome — endereço, cidade,
+    # telefone e observação do cadastro existente ficam intactos.
+    retirada = _pedido_retirada_balcao(pedido)
 
-    for campo, valor in _corrigir_endereco_clipp_no_banco(row[2], row[3]).items():
-        if valor:
-            updates[campo] = valor
+    if not retirada:
+        for campo, valor in _campos_endereco_para_db(cli).items():
+            if valor:
+                updates[campo] = valor
 
-    obs = _observacao_cliente(cli)
-    if obs:
-        updates["OBSERVACAO"] = obs
+        for campo, valor in _corrigir_endereco_clipp_no_banco(row[2], row[3]).items():
+            if valor:
+                updates[campo] = valor
 
-    _resolver_localizacao_cliente(cur, cli)
-    if cli.get("id_cidade"):
-        updates["ID_CIDADE"] = cli["id_cidade"][: lim.ID_CIDADE]
+        # Atualiza a observação do cadastro com os dados do cliente do pedido.
+        obs = _observacao_cliente(cli)
+        if obs:
+            updates["OBSERVACAO"] = obs
 
-    ddd, fone = _telefone_para_db(cli)
-    if ddd and fone:
-        updates["DDD_CELUL"] = ddd
-        updates["FONE_CELUL"] = fone
+        _resolver_localizacao_cliente(cur, cli)
+        if cli.get("id_cidade"):
+            updates["ID_CIDADE"] = cli["id_cidade"][: lim.ID_CIDADE]
+
+        ddd, fone = _telefone_para_db(cli)
+        if ddd and fone:
+            updates["DDD_CELUL"] = ddd
+            updates["FONE_CELUL"] = fone
 
     if updates:
         idx_row = {
@@ -1064,6 +1357,10 @@ def _garantir_documento_cliente(cur, id_cliente: int, pedido: PedidoExtraido) ->
                 (id_cliente, doc_db),
             )
 
+
+# ---------------------------------------------------------------------------
+# Cadastro e resolução de cliente (buscar → completar → inserir TB_CLIENTE)
+# ---------------------------------------------------------------------------
 
 def cadastrar_cliente(cur, pedido: PedidoExtraido) -> int:
     cli = pedido.cliente
@@ -1282,6 +1579,10 @@ def validar_cliente_para_importacao(
         cur.close()
         _fechar_conexao(con)
 
+
+# ---------------------------------------------------------------------------
+# Importação — fases separadas (só cliente / venda + itens) e gravação NF
+# ---------------------------------------------------------------------------
 
 def importar_cliente_fase(
     db_config: dict,
@@ -1556,6 +1857,10 @@ def _criar_registro_desfazer(
     return reg if reg.pode_desfazer else None
 
 
+# ---------------------------------------------------------------------------
+# Consulta de vendas, bloqueio de reimportação e controle pedidos_rpa.json
+# ---------------------------------------------------------------------------
+
 def consultar_venda_clipp(cur, id_nfvenda: int) -> dict | None:
     cur.execute(
         """
@@ -1581,6 +1886,17 @@ def consultar_venda_por_numero_pedido(cur, numero: str) -> dict | None:
     return vendas[0] if vendas else None
 
 
+def obs_referencia_pedido_site(obs: str, numero: str) -> bool:
+    """True quando OBS cita o pedido do site (evita falso positivo por substring)."""
+    num = str(numero).strip().lstrip("#")
+    if not num:
+        return False
+    texto = (obs or "").strip()
+    if not texto:
+        return False
+    return bool(re.search(rf"#?{re.escape(num)}(?:\D|$)", texto))
+
+
 def listar_vendas_por_numero_pedido(cur, numero: str) -> list[dict]:
     num = str(numero).strip().lstrip("#")
     cur.execute(
@@ -1594,12 +1910,15 @@ def listar_vendas_por_numero_pedido(cur, numero: str) -> list[dict]:
     )
     out: list[dict] = []
     for row in cur.fetchall():
+        obs = str(row[3] or "").strip()
+        if not obs_referencia_pedido_site(obs, num):
+            continue
         out.append(
             {
                 "id_nfvenda": int(row[0]),
                 "fim": str(row[1] or "").strip(),
                 "status": str(row[2] or "").strip(),
-                "obs": str(row[3] or "").strip(),
+                "obs": obs,
             }
         )
     return out
@@ -1619,13 +1938,17 @@ def venda_esta_cancelada(venda: dict | None) -> bool:
 def _buscar_venda_ativa_pedido(
     cur, numero: str, id_controle: int | None = None
 ) -> dict | None:
-    """Venda não cancelada ligada ao pedido (OBS ou id do controle local)."""
+    """Venda não cancelada cujo OBS referencia o pedido do site."""
     for venda in listar_vendas_por_numero_pedido(cur, numero):
         if not venda_esta_cancelada(venda):
             return venda
     if id_controle:
         venda = consultar_venda_clipp(cur, int(id_controle))
-        if venda and not venda_esta_cancelada(venda):
+        if (
+            venda
+            and not venda_esta_cancelada(venda)
+            and obs_referencia_pedido_site(venda.get("obs") or "", numero)
+        ):
             return venda
     return None
 
@@ -1648,6 +1971,17 @@ def sincronizar_controle_pedido_clipp(db_cfg: dict, numero: str) -> str | None:
     con = conectar(db_cfg)
     cur = con.cursor()
     try:
+        if id_controle_int:
+            v_reg = consultar_venda_clipp(cur, id_controle_int)
+            if v_reg and not obs_referencia_pedido_site(
+                v_reg.get("obs") or "", numero
+            ):
+                rpa.remover_pedido_controle(numero)
+                return (
+                    f"Controle local liberado — venda #{id_controle_int} "
+                    f"não corresponde ao pedido #{numero} neste banco."
+                )
+
         venda_ativa = _buscar_venda_ativa_pedido(cur, numero, id_controle_int)
         if venda_ativa is not None:
             return None
@@ -1704,6 +2038,17 @@ def mensagem_bloqueio_reimportacao(
         _fechar_conexao(con)
 
 
+def _chave_item_faltante(item: ItemPedido, num: int = 0) -> tuple:
+    """Chave única por linha do pedido (evita colapsar cartas distintas na mesma ref)."""
+    ref = (
+        item.referencia or item.sku or item.referencia_original or ""
+    ).strip().upper()
+    desc = (item.descricao or "").strip()[:80].upper()
+    qtd = int(item.quantidade or 1)
+    preco = round(float(item.preco_unitario or 0), 2)
+    return (ref or f"#{num}", desc, qtd, preco)
+
+
 def _item_faltante_de_pedido(item: ItemPedido) -> ItemFaltante:
     return ItemFaltante(
         referencia=(item.referencia or item.referencia_original or "").strip(),
@@ -1714,6 +2059,23 @@ def _item_faltante_de_pedido(item: ItemPedido) -> ItemFaltante:
         idioma=item.idioma,
         raridade=item.raridade,
     )
+
+
+def _logar_itens_nao_lidos(
+    nao_lidos: list[ItemFaltante],
+    on_log: Callable[[str], None] | None = None,
+) -> None:
+    if not nao_lidos or not on_log:
+        return
+    qtd = sum(f.quantidade for f in nao_lidos)
+    total = sum(f.preco_total for f in nao_lidos)
+    on_log(
+        f"Cartas não lidas pela extensão ({len(nao_lidos)} linha(s), {qtd} un.) "
+        f"— lance manualmente no CLIPP:"
+    )
+    for i, item in enumerate(nao_lidos, 1):
+        on_log(f" {i}.{item.linha_log().strip()}")
+    on_log(f"  Subtotal pendente: R$ {total:.2f}")
 
 
 def _logar_itens_faltantes(
@@ -1743,8 +2105,9 @@ def formatar_itens_faltantes_notepad(
     numero_pedido: str = "",
     id_venda: int | None = None,
     nf_numero: int | None = None,
+    titulo: str = "Cartas faltantes — lance manualmente no CLIPP",
 ) -> str:
-    linhas = ["Cartas faltantes — lance manualmente no CLIPP", ""]
+    linhas = [titulo, ""]
     pedido = str(numero_pedido or "").strip().lstrip("#")
     if pedido:
         linhas.append(f"Pedido site: #{pedido}")
@@ -1788,6 +2151,8 @@ def abrir_bloco_notas_faltantes(
     id_venda: int | None = None,
     nf_numero: int | None = None,
     on_log: Callable[[str], None] | None = None,
+    titulo: str = "Cartas faltantes — lance manualmente no CLIPP",
+    sufixo_arquivo: str = "faltantes",
 ) -> Path | None:
     """Grava lista de faltantes e abre no Bloco de Notas (Windows)."""
     if not faltantes:
@@ -1805,9 +2170,9 @@ def abrir_bloco_notas_faltantes(
         pedido = re.sub(r"[^\w\-#]", "_", str(numero_pedido or "pedido").strip())
         pedido = pedido.lstrip("#") or "pedido"
         if id_venda:
-            nome = f"pedido_{pedido}_venda_{id_venda}_faltantes.txt"
+            nome = f"pedido_{pedido}_venda_{id_venda}_{sufixo_arquivo}.txt"
         else:
-            nome = f"pedido_{pedido}_faltantes.txt"
+            nome = f"pedido_{pedido}_{sufixo_arquivo}.txt"
         arquivo = pasta / nome
         arquivo.write_text(
             "\ufeff"
@@ -1816,14 +2181,18 @@ def abrir_bloco_notas_faltantes(
                 numero_pedido=numero_pedido,
                 id_venda=id_venda,
                 nf_numero=nf_numero,
+                titulo=titulo,
             ),
             encoding="utf-8",
         )
         if sys.platform == "win32":
-            subprocess.Popen(
-                ["notepad.exe", str(arquivo)],
-                close_fds=True,
-            )
+            try:
+                os.startfile(str(arquivo))
+            except OSError:
+                subprocess.Popen(
+                    ["notepad.exe", str(arquivo)],
+                    close_fds=True,
+                )
             log(f"Bloco de Notas aberto — {arquivo.name}")
         else:
             log(f"Lista de faltantes salva em: {arquivo}")
@@ -1832,6 +2201,10 @@ def abrir_bloco_notas_faltantes(
         log(f"Não foi possível abrir o Bloco de Notas: {exc}")
         return None
 
+
+# ---------------------------------------------------------------------------
+# Estoque — busca de cartas (referência/idioma/raridade) e produtos selados (SKU)
+# ---------------------------------------------------------------------------
 
 def _detalhe_de_row_estoque(row) -> dict:
     return {
@@ -1857,6 +2230,10 @@ def _escolher_detalhe_rows(
     return _detalhe_de_row_estoque(rows[0][:3])
 
 
+def _compact_ref(ref: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (ref or "").upper())
+
+
 def _buscar_detalhe_referencia_sufixo(
     cur,
     ref: str,
@@ -1869,7 +2246,8 @@ def _buscar_detalhe_referencia_sufixo(
     if not ref_u:
         return None
     sql = """
-        SELECT FIRST 20 ID_IDENTIFICADOR, PROD_SERV, PRC_VENDA, PRC_VENDA
+        SELECT FIRST 20 ID_IDENTIFICADOR, PROD_SERV, PRC_VENDA, PRC_VENDA,
+               UPPER(TRIM(REFERENCIA))
         FROM V_ESTOQUE_2
         WHERE UPPER(TRIM(REFERENCIA)) LIKE ?
     """
@@ -1882,16 +2260,31 @@ def _buscar_detalhe_referencia_sufixo(
     rows = cur.fetchall()
     if not rows:
         return None
+    pref_set = _compact_ref(ref_u.split("-")[0]) if "-" in ref_u else ""
+    if pref_set and len(pref_set) >= 3:
+        rows = [
+            r for r in rows
+            if str(r[4] or "").upper().startswith(pref_set)
+        ]
+    if not rows:
+        return None
     det = _escolher_detalhe_rows(rows, preco_alvo)
     if not det:
         return None
-    cur.execute(
-        "SELECT FIRST 1 UPPER(TRIM(REFERENCIA)) FROM V_ESTOQUE_2 WHERE ID_IDENTIFICADOR = ?",
-        (det["id_identificador"],),
+    id_esc = int(det["id_identificador"])
+    ref_clipp = next(
+        (str(r[4] or "").strip().upper() for r in rows if int(r[0]) == id_esc),
+        "",
     )
-    row = cur.fetchone()
-    if row:
-        det["_referencia_clipp"] = str(row[0])
+    if not ref_clipp:
+        cur.execute(
+            "SELECT FIRST 1 UPPER(TRIM(REFERENCIA)) FROM V_ESTOQUE_2 WHERE ID_IDENTIFICADOR = ?",
+            (id_esc,),
+        )
+        row = cur.fetchone()
+        ref_clipp = str(row[0] or "").strip().upper() if row else ""
+    if ref_clipp:
+        det["_referencia_clipp"] = ref_clipp
     return det
 
 
@@ -1967,6 +2360,7 @@ def _candidatos_referencia_produto(
     referencia_original: str | None = None,
     *,
     idioma: str | None = None,
+    reprint: bool | None = None,
 ) -> list[str]:
     """Ordem: convertida, original; EN↔PT só se idioma não estiver definido."""
     vistos: set[str] = set()
@@ -1985,6 +2379,13 @@ def _candidatos_referencia_produto(
 
     add(referencia)
     add(referencia_original)
+    if reprint is True:
+        for u in list(candidatos):
+            if u.endswith("RP"):
+                continue
+            add(f"{u}RP")
+    elif reprint is False:
+        candidatos[:] = [c for c in candidatos if not c.endswith("RP")]
     idioma_u = (idioma or "").upper()
     if idioma_u == "PT":
         candidatos[:] = [c for c in candidatos if "-EN" not in c]
@@ -2005,38 +2406,86 @@ def _id_grupo2_por_raridade(
     raridade: str,
     cache: dict[tuple[int, str], int | None],
 ) -> int | None:
-    norm = _normalizar_raridade(raridade)
-    chave = (id_grupo, norm)
-    if chave in cache:
-        return cache[chave]
+    for token in tokens_raridade_grupo2(raridade):
+        chave = (id_grupo, token)
+        if chave in cache:
+            encontrado = cache[chave]
+            if encontrado is not None:
+                return encontrado
+            continue
 
+        cur.execute(
+            """
+            SELECT FIRST 1 ID
+            FROM TB_EST_GRUPO_SUB
+            WHERE ID_GRUPO = ?
+              AND UPPER(TRIM(DESCRICAO)) = ?
+            """,
+            (id_grupo, token),
+        )
+        row = cur.fetchone()
+        if row:
+            cache[chave] = int(row[0])
+            return cache[chave]
+
+        cur.execute(
+            """
+            SELECT FIRST 1 ID
+            FROM TB_EST_GRUPO_SUB
+            WHERE ID_GRUPO = ?
+              AND UPPER(TRIM(DESCRICAO)) CONTAINING ?
+            ORDER BY CHAR_LENGTH(DESCRICAO)
+            """,
+            (id_grupo, token),
+        )
+        row = cur.fetchone()
+        if row:
+            cache[chave] = int(row[0])
+            return cache[chave]
+
+        cache[chave] = None
+
+    return None
+
+
+def _buscar_detalhe_v_estoque_grupo2_palavra(
+    cur,
+    ref: str,
+    *,
+    id_grupo: int,
+    palavra_raridade: str,
+    preco_alvo: float | None = None,
+) -> dict | None:
+    """Quando há várias linhas com a mesma REFERENCIA, filtra pelo grupo2 (raridade)."""
+    palavra = (palavra_raridade or "").strip().upper()
+    if not palavra:
+        return None
     cur.execute(
         """
-        SELECT FIRST 1 ID
-        FROM TB_EST_GRUPO_SUB
-        WHERE ID_GRUPO = ?
-          AND UPPER(TRIM(DESCRICAO)) = ?
+        SELECT FIRST 20 v.ID_IDENTIFICADOR, v.PROD_SERV, v.PRC_VENDA, v.PRC_VENDA
+        FROM V_ESTOQUE_2 v
+        INNER JOIN TB_EST_GRUPO_SUB g ON g.ID = v.ID_GRUPO2
+        WHERE UPPER(TRIM(v.REFERENCIA)) = ?
+          AND v.ID_GRUPO = ?
+          AND UPPER(TRIM(g.DESCRICAO)) CONTAINING ?
+        ORDER BY v.ID_IDENTIFICADOR
         """,
-        (id_grupo, norm),
+        (ref.upper(), int(id_grupo), palavra),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return None
+    det = _escolher_detalhe_rows(rows, preco_alvo)
+    if not det:
+        return None
+    cur.execute(
+        "SELECT FIRST 1 UPPER(TRIM(REFERENCIA)) FROM V_ESTOQUE_2 WHERE ID_IDENTIFICADOR = ?",
+        (det["id_identificador"],),
     )
     row = cur.fetchone()
     if row:
-        cache[chave] = int(row[0])
-        return cache[chave]
-
-    cur.execute(
-        """
-        SELECT FIRST 1 ID
-        FROM TB_EST_GRUPO_SUB
-        WHERE ID_GRUPO = ?
-          AND UPPER(TRIM(DESCRICAO)) CONTAINING ?
-        ORDER BY CHAR_LENGTH(DESCRICAO)
-        """,
-        (id_grupo, norm),
-    )
-    row = cur.fetchone()
-    cache[chave] = int(row[0]) if row else None
-    return cache[chave]
+        det["_referencia_clipp"] = str(row[0])
+    return det
 
 
 def _contar_produtos_ref(
@@ -2093,37 +2542,151 @@ def _buscar_detalhe_v_estoque(
     }
 
 
-def _buscar_detalhe_sku(cur, sku: str) -> dict | None:
-    """Produto selado: SKU do site = REFERENCIA em TB_EST_PRODUTO_2."""
+def _buscar_detalhe_selado_por_descricao(
+    cur,
+    descricao: str | None,
+    *,
+    preco_alvo: float | None = None,
+) -> dict | None:
+    """Fallback quando SKU do site ≠ REFERENCIA no CLIPP.
+
+    Vale para selados Yu-Gi-Oh! (YGO…) e produtos com SKU livre (ex.: Field
+    Center «yummyjf» → REFERENCIA «yummyf»). Casa pelo nome do produto.
+    """
+    desc = re.sub(r"\s+", " ", (descricao or "").upper()).strip()
+    if len(desc) < 8:
+        return None
+
+    def _consultar(trecho: str, apenas_yg: bool) -> list:
+        filtro = "AND UPPER(TRIM(REFERENCIA)) LIKE 'YG%'" if apenas_yg else ""
+        cur.execute(
+            f"""
+            SELECT FIRST 20 ID_IDENTIFICADOR, PROD_SERV, PRC_VENDA, PRC_VENDA,
+                   UPPER(TRIM(REFERENCIA))
+            FROM V_ESTOQUE_2
+            WHERE UPPER(PROD_SERV) CONTAINING ?
+              {filtro}
+            ORDER BY ID_IDENTIFICADOR
+            """,
+            (trecho,),
+        )
+        return cur.fetchall()
+
+    def _resolver(rows: list) -> dict | None:
+        if not rows:
+            return None
+        if len(rows) == 1:
+            return {
+                "id_identificador": int(rows[0][0]),
+                "prod_serv": str(rows[0][1] or "").strip()[:60],
+                "prc_venda": float(rows[0][2] or 0),
+                "_referencia_clipp": str(rows[0][4] or "").strip().upper(),
+            }
+        det = _escolher_detalhe_rows(rows, preco_alvo)
+        if det:
+            cur.execute(
+                "SELECT FIRST 1 UPPER(TRIM(REFERENCIA)) FROM V_ESTOQUE_2 WHERE ID_IDENTIFICADOR = ?",
+                (det["id_identificador"],),
+            )
+            row = cur.fetchone()
+            if row:
+                det["_referencia_clipp"] = str(row[0])
+            return det
+        return None
+
+    # 1) Match preciso pelo nome completo do produto (sem restrição de prefixo).
+    if len(desc) >= 12:
+        det = _resolver(_consultar(desc[:60], apenas_yg=False))
+        if det:
+            return det
+
+    # 2) Tokens — primeiro restrito a YGO (selados Yu-Gi-Oh!), depois geral.
+    tokens = [t for t in re.split(r"[^A-Z0-9]+", desc) if len(t) >= 5]
+    tokens.sort(key=len, reverse=True)
+    vistos: set[str] = set()
+    for apenas_yg in (True, False):
+        for trecho in tokens[:4]:
+            t = trecho.strip()
+            chave = f"{int(apenas_yg)}:{t}"
+            if not t or chave in vistos:
+                continue
+            vistos.add(chave)
+            det = _resolver(_consultar(t, apenas_yg))
+            if det:
+                return det
+    return None
+
+
+def _buscar_detalhe_sku(
+    cur,
+    sku: str,
+    *,
+    descricao: str | None = None,
+    preco_alvo: float | None = None,
+) -> dict | None:
+    """Produto selado: SKU do site = REFERENCIA em TB_EST_PRODUTO_2 / V_ESTOQUE_2."""
     sku_u = sku.strip().upper()
     if not sku_u:
         return None
-    det = _buscar_detalhe_ref_exata(cur, sku_u)
-    if det:
-        det = dict(det)
-        det["_referencia_clipp"] = sku_u
-        return det
-    cur.execute(
-        """
-        SELECT FIRST 1 ID_IDENTIFICADOR
-        FROM TB_EST_PRODUTO_2
-        WHERE UPPER(TRIM(REFERENCIA)) = ?
-        ORDER BY ID_IDENTIFICADOR
-        """,
-        (sku_u,),
+
+    for cand in candidatos_sku_clipp(sku_u):
+        det = _buscar_detalhe_ref_exata(cur, cand)
+        if det:
+            det = dict(det)
+            det["_referencia_clipp"] = cand
+            return det
+
+    digits = re.sub(r"\D", "", sku_u)
+    sufixos = []
+    if len(digits) >= 5:
+        sufixos.append(digits)
+        sem_zeros = digits.lstrip("0")
+        if sem_zeros and sem_zeros != digits:
+            sufixos.append(sem_zeros)
+
+    for sufixo in sufixos:
+        cur.execute(
+            """
+            SELECT FIRST 10 ID_IDENTIFICADOR, PROD_SERV, PRC_VENDA, PRC_VENDA,
+                   UPPER(TRIM(REFERENCIA))
+            FROM V_ESTOQUE_2
+            WHERE UPPER(TRIM(REFERENCIA)) LIKE 'YG%'
+              AND UPPER(TRIM(REFERENCIA)) CONTAINING ?
+            ORDER BY CHAR_LENGTH(REFERENCIA), ID_IDENTIFICADOR
+            """,
+            (sufixo,),
+        )
+        rows = cur.fetchall()
+        if len(rows) == 1:
+            ref = str(rows[0][4] or "").strip().upper()
+            det = {
+                "id_identificador": int(rows[0][0]),
+                "prod_serv": str(rows[0][1] or "").strip()[:60],
+                "prc_venda": float(rows[0][2] or 0),
+                "_referencia_clipp": ref or sku_u,
+            }
+            return det
+        if len(rows) > 1:
+            det = _escolher_detalhe_rows(rows, None)
+            if det:
+                cur.execute(
+                    "SELECT FIRST 1 UPPER(TRIM(REFERENCIA)) FROM V_ESTOQUE_2 WHERE ID_IDENTIFICADOR = ?",
+                    (det["id_identificador"],),
+                )
+                row = cur.fetchone()
+                if row:
+                    det["_referencia_clipp"] = str(row[0])
+                return det
+
+    return _buscar_detalhe_selado_por_descricao(
+        cur, descricao, preco_alvo=preco_alvo
     )
-    row = cur.fetchone()
-    if row:
-        det = _detalhe_produto_por_id(cur, int(row[0]))
-        det["_referencia_clipp"] = sku_u
-        return det
-    return None
 
 
 def _detalhe_produto_por_id(cur, id_prod: int) -> dict:
     cur.execute(
         """
-        SELECT FIRST 1 PROD_SERV, PRC_VENDA
+        SELECT FIRST 1 PROD_SERV, PRC_VENDA, PRC_CUSTO, CONVERSOR, UNI_MEDIDA
         FROM V_ESTOQUE_2
         WHERE ID_IDENTIFICADOR = ?
         """,
@@ -2135,12 +2698,28 @@ def _detalhe_produto_por_id(cur, id_prod: int) -> dict:
             "id_identificador": id_prod,
             "prod_serv": "",
             "prc_venda": 0.0,
+            "prc_custo": 0.0,
+            "conversor": 1.0,
+            "uni_medida": "UN",
         }
     return {
         "id_identificador": id_prod,
         "prod_serv": str(det[0] or "").strip()[:60],
         "prc_venda": float(det[1] or 0),
+        "prc_custo": float(det[2] or 0),
+        "conversor": float(det[3] if det[3] is not None else 1),
+        "uni_medida": (str(det[4] or "UN").strip() or "UN"),
     }
+
+
+def _campos_item_nfvenda(cur, id_prod: int, det: dict | None = None) -> dict:
+    """Completa dados do produto para gravar item como no lançamento manual do CLIPP."""
+    base = dict(det or {})
+    base["id_identificador"] = int(id_prod)
+    extra = _detalhe_produto_por_id(cur, id_prod)
+    for chave, valor in extra.items():
+        base.setdefault(chave, valor)
+    return base
 
 
 def _buscar_detalhe_ref_exata(
@@ -2155,6 +2734,11 @@ def _buscar_detalhe_ref_exata(
     )
     if det:
         return det
+
+    # Com filtro de raridade (grupo2), não cair no fallback por REFERENCIA pura:
+    # ele ignora grupo/grupo2 e devolveria a 1ª variante (raridade errada).
+    if id_grupo2 is not None:
+        return None
 
     cur.execute(
         """
@@ -2204,6 +2788,85 @@ def _escolher_detalhe_por_preco(
     return matches[0]
 
 
+def _variantes_ref_grupo(
+    cur,
+    referencia: str,
+    referencia_original: str | None,
+    *,
+    idioma: str | None,
+    id_grupo: int,
+    reprint: bool | None = None,
+) -> list[tuple[str, dict]]:
+    """Todas as variantes (raridades) de uma referência dentro do grupo-pai.
+
+    Busca direto na V_ESTOQUE_2 por REFERENCIA + ID_GRUPO, então inclui também
+    variantes cujo ID_GRUPO2 pertence à lista de subgrupos de outro grupo-pai
+    (ex.: produto em Suporte cadastrado com raridade da lista de Colecionáveis).
+    """
+    out: list[tuple[str, dict]] = []
+    vistos: set[int] = set()
+    for cand in _candidatos_referencia_produto(
+        referencia, referencia_original, idioma=idioma, reprint=reprint
+    ):
+        cur.execute(
+            """
+            SELECT v.ID_IDENTIFICADOR, v.PROD_SERV, v.PRC_VENDA,
+                   COALESCE(g.DESCRICAO, '')
+            FROM V_ESTOQUE_2 v
+            LEFT JOIN TB_EST_GRUPO_SUB g ON g.ID = v.ID_GRUPO2
+            WHERE UPPER(TRIM(v.REFERENCIA)) = ?
+              AND v.ID_GRUPO = ?
+            ORDER BY v.ID_IDENTIFICADOR
+            """,
+            (cand.upper(), int(id_grupo)),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            continue
+        for r in rows:
+            idid = int(r[0])
+            if idid in vistos:
+                continue
+            vistos.add(idid)
+            out.append(
+                (
+                    cand,
+                    {
+                        "id_identificador": idid,
+                        "prod_serv": str(r[1] or "").strip()[:60],
+                        "prc_venda": float(r[2] or 0),
+                        "_raridade_desc": str(r[3] or "").strip().upper(),
+                    },
+                )
+            )
+        if out:
+            break
+    return out
+
+
+def _casar_variante_por_raridade(
+    variantes: list[tuple[str, dict]], raridade: str | None
+) -> tuple[str, dict] | None:
+    """Desempata variantes pela raridade comparando o NOME do subgrupo."""
+    if not raridade or not variantes:
+        return None
+    tokens = [t for t in tokens_raridade_grupo2(raridade) if t]
+    if not tokens:
+        return None
+    # 1) Igualdade exata do nome do subgrupo com algum token.
+    for cand, det in variantes:
+        desc = det.get("_raridade_desc") or ""
+        if any(desc == t for t in tokens):
+            return cand, det
+    # 2) Token mais específico (o primeiro/maior) contido no nome.
+    principal = tokens[0]
+    for cand, det in variantes:
+        desc = det.get("_raridade_desc") or ""
+        if principal and principal in desc:
+            return cand, det
+    return None
+
+
 def _coletar_detalhes_candidatos(
     cur,
     referencia: str,
@@ -2214,10 +2877,11 @@ def _coletar_detalhes_candidatos(
     id_grupo2: int | None,
     usa_grupo2: bool,
     cache_grupo2_listas: dict[int, list[int]] | None = None,
+    reprint: bool | None = None,
 ) -> list[tuple[str, dict]]:
     matches: list[tuple[str, dict]] = []
     for cand in _candidatos_referencia_produto(
-        referencia, referencia_original, idioma=idioma
+        referencia, referencia_original, idioma=idioma, reprint=reprint
     ):
         if usa_grupo2 and id_grupo is not None:
             grupo2_ids = (
@@ -2253,6 +2917,13 @@ def _coletar_detalhes_candidatos(
                 det = None
         else:
             det = _buscar_detalhe_ref_exata(cur, cand)
+            if (
+                det
+                and id_grupo is not None
+                and id_grupo2 is None
+                and _contar_produtos_ref(cur, cand, id_grupo=int(id_grupo)) > 1
+            ):
+                det = None
 
         if det:
             matches.append((cand, det))
@@ -2277,6 +2948,181 @@ def _aplicar_referencia_encontrada(item: ItemPedido, ref_encontrada: str) -> Non
         item.idioma = idioma
 
 
+def _sem_acento(texto: str) -> str:
+    return "".join(
+        ch
+        for ch in unicodedata.normalize("NFKD", texto or "")
+        if not unicodedata.combining(ch)
+    )
+
+
+def _parse_ref_pokemon(ref: str) -> tuple[str, int, int] | None:
+    """De 'PGO 006/078' / 'UNB 7/214' / '082/196' → (sigla, numero, total)."""
+    ref_u = (ref or "").strip().upper()
+    m = re.search(r"(\d+)\s*/\s*(\d+)\s*$", ref_u)
+    if not m:
+        return None
+    numero = int(m.group(1))
+    total = int(m.group(2))
+    prefixo = ref_u[: m.start()].strip(" -/")
+    ms = re.match(r"^([A-Z]+)", prefixo)
+    sigla = ms.group(1) if ms else ""
+    return sigla, numero, total
+
+
+def _nome_de_prod_serv(prod_serv: str) -> str:
+    """Nome da carta a partir de 'NOME - SIGLA NUM/TOTAL' (Pokémon)."""
+    s = re.sub(r"\s+", " ", (prod_serv or "").strip())
+    if " - " in s:
+        s = s.rsplit(" - ", 1)[0]
+    return _sem_acento(s).strip().upper()
+
+
+def _pokemon_raridade_alvo(raridade_site: str | None) -> str | None:
+    """Mapeia a raridade do site para o nome do grupo2 Pokémon no CLIPP."""
+    r = _sem_acento(_normalizar_raridade(raridade_site or "")).upper()
+    if not r:
+        return None
+    if "REVERSE" in r:
+        return "REVERSE FOIL"
+    if "VSTAR" in r or "V-STAR" in r or "V STAR" in r or "VASTRO" in r or "V-ASTRO" in r or "V ASTRO" in r:
+        return "V-ASTRO"
+    if "ULTRA" in r:
+        return "ULTRA RARA"
+    if "SECRET" in r:
+        return "SECRETO RARA"
+    if "PROMO" in r:
+        return "PROMO"
+    if "FOIL" in r or "HOLO" in r:
+        return "FOIL"
+    if "INCOM" in r or "UNCOMMON" in r:
+        return "INCOMUN"
+    if r.strip() == "V":
+        return "V"
+    if "RARA" in r or r.strip() == "RARE":
+        return "RARA"
+    if "COMUM" in r or "COMMON" in r:
+        return "COMUM"
+    return None
+
+
+def _carregar_indice_pokemon(
+    cur,
+    id_grupo: int,
+    cache_idx: dict[int, dict] | None = None,
+) -> dict[tuple[int, int], list[dict]]:
+    """Carrega todos os produtos do grupo Pokémon indexados por (numero, total)."""
+    if cache_idx is not None and id_grupo in cache_idx:
+        return cache_idx[id_grupo]
+    cur.execute(
+        """
+        SELECT ID_IDENTIFICADOR, PROD_SERV, PRC_VENDA, GRUPO2, REFERENCIA,
+               PRC_CUSTO, CONVERSOR, UNI_MEDIDA
+        FROM V_ESTOQUE_2
+        WHERE ID_GRUPO = ?
+        """,
+        (int(id_grupo),),
+    )
+    idx: dict[tuple[int, int], list[dict]] = {}
+    for row in cur.fetchall():
+        ref = str(row[4] or "")
+        p = _parse_ref_pokemon(ref)
+        if not p:
+            continue
+        _sigla, numero, total = p
+        det = {
+            "id_identificador": int(row[0]),
+            "prod_serv": str(row[1] or "").strip()[:60],
+            "prc_venda": float(row[2] or 0),
+            "grupo2": str(row[3] or "").strip(),
+            "_referencia_clipp": str(ref).strip().upper(),
+            "prc_custo": float(row[5] or 0),
+            "conversor": float(row[6] or 1) or 1.0,
+            "uni_medida": (str(row[7] or "UN").strip() or "UN"),
+            "_nome_norm": _nome_de_prod_serv(str(row[1] or "")),
+        }
+        idx.setdefault((numero, total), []).append(det)
+    if cache_idx is not None:
+        cache_idx[id_grupo] = idx
+    return idx
+
+
+def _escolher_pokemon(
+    cands: list[dict], raridade: str | None, preco_alvo: float | None
+) -> dict | None:
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0]
+    # 1) Raridade do site decide a variante (mais preciso para Pokémon).
+    alvo = _pokemon_raridade_alvo(raridade)
+    if alvo:
+        for d in cands:
+            if _sem_acento(d.get("grupo2") or "").upper() == alvo:
+                return d
+    # 2) Sem raridade no site: desempata por preço.
+    if preco_alvo and preco_alvo > 0:
+        d = min(cands, key=lambda x: abs(float(x.get("prc_venda") or 0) - preco_alvo))
+        if abs(float(d.get("prc_venda") or 0) - preco_alvo) <= 0.05:
+            return d
+    # 3) Padrão: variante COMUM; senão a primeira.
+    for d in cands:
+        if _sem_acento(d.get("grupo2") or "").upper() == "COMUM":
+            return d
+    return cands[0]
+
+
+def _e_carta_pokemon(item) -> bool:
+    """Carta avulsa Pokémon: tem número/total e não é selado (SKU)."""
+    if getattr(item, "sku", None):
+        return False
+    if (getattr(item, "jogo", None) or "").lower() == "pokemon":
+        return bool(getattr(item, "numero", None) and getattr(item, "total", None))
+    num = getattr(item, "numero", None)
+    tot = getattr(item, "total", None)
+    return bool(num and tot)
+
+
+def buscar_produto_pokemon(
+    cur,
+    *,
+    nome: str,
+    numero: int,
+    total: int,
+    raridade: str | None = None,
+    preco_alvo: float | None = None,
+    id_grupo: int = 27,
+    cache_idx: dict[int, dict] | None = None,
+) -> dict | None:
+    """Casa carta avulsa Pokémon por nome + número/total + raridade.
+
+    Número/total comparados numericamente (o zero-padding varia no cadastro).
+    Variantes de mesma carta (raridades) são desempatadas por raridade do site,
+    depois por preço, e por fim pela variante COMUM.
+    """
+    if not nome or not numero or not total:
+        return None
+    idx = _carregar_indice_pokemon(cur, int(id_grupo), cache_idx)
+    cands = idx.get((int(numero), int(total))) or []
+    if not cands:
+        return None
+    nome_alvo = _sem_acento(str(nome)).strip().upper()
+    exatos = [d for d in cands if d.get("_nome_norm") == nome_alvo]
+    if not exatos:
+        exatos = [
+            d
+            for d in cands
+            if d.get("_nome_norm", "").startswith(nome_alvo)
+            or nome_alvo in d.get("_nome_norm", "")
+        ]
+    if not exatos:
+        return None
+    escolhido = _escolher_pokemon(exatos, raridade, preco_alvo)
+    if not escolhido:
+        return None
+    return dict(escolhido)
+
+
 def buscar_produto_detalhe(
     cur,
     referencia: str,
@@ -2291,6 +3137,7 @@ def buscar_produto_detalhe(
     cache_grupo2: dict[tuple[int, str], int | None] | None = None,
     preco_alvo: float | None = None,
     cache_grupo2_listas: dict[int, list[int]] | None = None,
+    reprint: bool | None = None,
     _sem_filtro_raridade: bool = False,
 ) -> dict | None:
     """Busca produto em V_ESTOQUE_2 / TB_EST_PRODUTO_2 com filtros de idioma e raridade."""
@@ -2303,7 +3150,9 @@ def buscar_produto_detalhe(
     if sku_u:
         if cache is not None and sku_u in cache:
             return cache[sku_u]
-        det = _buscar_detalhe_sku(cur, sku_u)
+        det = _buscar_detalhe_sku(
+            cur, sku_u, descricao=descricao, preco_alvo=preco_alvo
+        )
         if cache is not None:
             cache[sku_u] = det
         if det:
@@ -2316,12 +3165,13 @@ def buscar_produto_detalhe(
     if not ref:
         return None
 
-    if cache is not None and ref in cache:
-        return cache[ref]
-
     id_grupo = clipp_cfg.get("id_grupo_yugioh")
     sets_grupo2 = clipp_cfg.get("sets_grupo2")
 
+    # Converte o sufixo de idioma ANTES do cache/consulta: a referência do site
+    # às vezes vem com o idioma trocado (ex.: BOSH-PT099 numa carta EN) e a
+    # bandeira é a fonte da verdade. Se checar o cache com a ref crua, o match
+    # exato casa a variante errada e o idioma é ignorado.
     if idioma == "PT" and "-EN" in ref:
         referencia = ref.replace("-EN", "-PT", 1)
         ref = referencia.upper()
@@ -2337,12 +3187,24 @@ def buscar_produto_detalhe(
             raridade=raridade,
             sets_grupo2=sets_grupo2,
             sets_legacy_pt_prefix=clipp_cfg.get("sets_legacy_pt_prefix"),
+            reprint=bool(reprint),
         )
         if ref_conv.upper() != ref:
             referencia = ref_conv
             ref = referencia.upper()
 
     usa_grupo2 = set_usa_grupo2(ref, sets_grupo2)
+
+    # Referências multi-variante (RA0x: mesma REFERENCIA com raridades diferentes
+    # no ID_GRUPO2) NÃO podem usar o cache por ref — cada item resolve pela sua
+    # raridade/preço. Sem isso, o 2º item repete o produto do 1º.
+    if (
+        cache is not None
+        and ref in cache
+        and not (usa_grupo2 and id_grupo is not None)
+    ):
+        return cache[ref]
+
     id_grupo2 = None
     if raridade and id_grupo is not None and not _sem_filtro_raridade:
         if cache_grupo2 is None:
@@ -2352,24 +3214,61 @@ def buscar_produto_detalhe(
         )
 
     if usa_grupo2 and id_grupo is not None:
-        matches = _coletar_detalhes_candidatos(
+        # Cartas RA0x têm várias variantes na mesma REFERENCIA, diferindo só pela
+        # raridade (ID_GRUPO2). Como cada raridade existe duplicada nas listas de
+        # subgrupos (Colecionáveis x Suporte), juntamos TODAS as linhas da
+        # referência no grupo-pai direto na V_ESTOQUE_2 (qualquer subgrupo).
+        # O preço do site é o sinal mais confiável; a raridade (heurística) só
+        # decide quando bate com o preço, ou quando não há preço.
+        variantes = _variantes_ref_grupo(
             cur,
             referencia,
             referencia_original,
             idioma=idioma,
             id_grupo=int(id_grupo),
-            id_grupo2=id_grupo2,
-            usa_grupo2=True,
-            cache_grupo2_listas=cache_grupo2_listas,
+            reprint=reprint,
         )
-        escolhido = _escolher_detalhe_por_preco(matches, preco_alvo)
+
+        def _preco_confere(det: dict) -> bool:
+            if not (preco_alvo and preco_alvo > 0):
+                return False
+            return abs(float(det.get("prc_venda") or 0) - preco_alvo) <= 0.05
+
+        escolhido = None
+        # 1) Preço bate em alguma variante → sinal mais forte.
+        if preco_alvo and preco_alvo > 0 and variantes:
+            cand, det = min(
+                variantes,
+                key=lambda x: abs(float(x[1].get("prc_venda") or 0) - preco_alvo),
+            )
+            if _preco_confere(det):
+                # Se houver empate de preço, prefere a que casa a raridade.
+                empatadas = [
+                    v for v in variantes if _preco_confere(v[1])
+                ]
+                if len(empatadas) > 1:
+                    escolhido = (
+                        _casar_variante_por_raridade(empatadas, raridade)
+                        or (cand, det)
+                    )
+                else:
+                    escolhido = (cand, det)
+
+        # 2) Sem casar por preço: usa a raridade detectada (pelo nome do subgrupo).
+        if not escolhido:
+            escolhido = _casar_variante_por_raridade(variantes, raridade)
+
+        # 3) Sem preço e sem raridade: 1ª variante. Com preço sem casar e sem
+        #    raridade, deixa o fallback decidir.
+        if not escolhido and variantes:
+            if not (preco_alvo and preco_alvo > 0):
+                escolhido = variantes[0]
+
         if escolhido:
             cand, det = escolhido
             det = dict(det)
             det["_referencia_clipp"] = cand
-            if cache is not None:
-                cache[ref] = det
-                cache[cand] = det
+            # Não cacheia por ref: multi-variante (cada raridade é um produto).
             return det
         return _buscar_produto_detalhe_fallback(
             cur,
@@ -2383,6 +3282,7 @@ def buscar_produto_detalhe(
             cache_grupo2=cache_grupo2,
             preco_alvo=preco_alvo,
             cache_grupo2_listas=cache_grupo2_listas,
+            reprint=reprint,
             ref_cache=ref,
         )
 
@@ -2395,11 +3295,33 @@ def buscar_produto_detalhe(
         id_grupo2=id_grupo2,
         usa_grupo2=bool(usa_grupo2 and id_grupo is not None),
         cache_grupo2_listas=cache_grupo2_listas,
+        reprint=reprint,
     )
+    if not matches and raridade and id_grupo is not None and not _sem_filtro_raridade:
+        for token in tokens_raridade_grupo2(raridade):
+            for cand in _candidatos_referencia_produto(
+                referencia,
+                referencia_original,
+                idioma=idioma,
+                reprint=reprint,
+            ):
+                det = _buscar_detalhe_v_estoque_grupo2_palavra(
+                    cur,
+                    cand,
+                    id_grupo=int(id_grupo),
+                    palavra_raridade=token,
+                    preco_alvo=preco_alvo,
+                )
+                if det:
+                    matches.append((cand, det))
+                    break
+            if matches:
+                break
+
     if not matches:
         # fallback legado com cache por candidato
         for cand in _candidatos_referencia_produto(
-            referencia, referencia_original, idioma=idioma
+            referencia, referencia_original, idioma=idioma, reprint=reprint
         ):
             if cache is not None and cand in cache:
                 det = cache[cand]
@@ -2424,6 +3346,13 @@ def buscar_produto_detalhe(
                     det = None
             else:
                 det = _buscar_detalhe_ref_exata(cur, cand)
+                if (
+                    det
+                    and id_grupo is not None
+                    and id_grupo2 is None
+                    and _contar_produtos_ref(cur, cand, id_grupo=int(id_grupo)) > 1
+                ):
+                    det = None
 
             if cache is not None:
                 cache[cand] = det
@@ -2444,6 +3373,7 @@ def buscar_produto_detalhe(
             cache_grupo2=cache_grupo2,
             preco_alvo=preco_alvo,
             cache_grupo2_listas=cache_grupo2_listas,
+            reprint=reprint,
             ref_cache=ref,
         )
 
@@ -2461,6 +3391,7 @@ def buscar_produto_detalhe(
             cache_grupo2=cache_grupo2,
             preco_alvo=preco_alvo,
             cache_grupo2_listas=cache_grupo2_listas,
+            reprint=reprint,
             ref_cache=ref,
         )
     cand, det = escolhido
@@ -2487,6 +3418,7 @@ def _buscar_produto_detalhe_fallback(
     preco_alvo: float | None,
     cache_grupo2_listas: dict[int, list[int]] | None,
     ref_cache: str,
+    reprint: bool | None = None,
 ) -> dict | None:
     if cache is not None:
         cache.pop(ref_cache, None)
@@ -2509,6 +3441,7 @@ def _buscar_produto_detalhe_fallback(
             cache_grupo2=cache_grupo2,
             preco_alvo=preco_alvo,
             cache_grupo2_listas=cache_grupo2_listas,
+            reprint=reprint,
             _sem_filtro_raridade=True,
         )
         if det:
@@ -2519,7 +3452,7 @@ def _buscar_produto_detalhe_fallback(
     )
 
     for cand in _candidatos_referencia_produto(
-        referencia, referencia_original, idioma=idioma
+        referencia, referencia_original, idioma=idioma, reprint=reprint
     ):
         for grupo_filtro in grupos_busca:
             det = _buscar_detalhe_referencia_sufixo(
@@ -2594,7 +3527,11 @@ def _precarregar_cache_referencias_exatas(
     if not refs:
         return 0
 
-    carregados = 0
+    # Agrupa por referência: só dá para cachear quem tem UMA única variante.
+    # Referências com várias linhas (ex.: RA0x com raridades diferindo só pelo
+    # ID_GRUPO2) precisam passar pela resolução por preço/raridade, então NÃO
+    # entram no cache aqui (senão a última variante venceria por engano).
+    por_ref: dict[str, list[dict]] = {}
     for i in range(0, len(refs), 80):
         chunk = refs[i : i + 80]
         marcadores = ",".join("?" * len(chunk))
@@ -2610,13 +3547,19 @@ def _precarregar_cache_referencias_exatas(
             ref = str(row[3] or "").strip().upper()
             if not ref:
                 continue
-            det = {
-                "id_identificador": int(row[0]),
-                "prod_serv": str(row[1] or "").strip()[:60],
-                "prc_venda": float(row[2] or 0),
-                "_referencia_clipp": ref,
-            }
-            cache[ref] = det
+            por_ref.setdefault(ref, []).append(
+                {
+                    "id_identificador": int(row[0]),
+                    "prod_serv": str(row[1] or "").strip()[:60],
+                    "prc_venda": float(row[2] or 0),
+                    "_referencia_clipp": ref,
+                }
+            )
+
+    carregados = 0
+    for ref, dets in por_ref.items():
+        if len(dets) == 1:
+            cache[ref] = dets[0]
             carregados += 1
     return carregados
 
@@ -2630,25 +3573,39 @@ def vincular_produtos_pedido(con, pedido: PedidoExtraido) -> list[ItemFaltante]:
     cache: dict[str, dict | None] = {}
     cache_grupo2: dict[tuple[int, str], int | None] = {}
     cache_grupo2_listas: dict[int, list[int]] = {}
+    cache_pokemon: dict[int, dict] = {}
     clipp_cfg = get_clipp_config()
     cur = con.cursor()
     try:
         _precarregar_cache_referencias_exatas(cur, pedido.itens, cache)
-        for item in pedido.itens:
-            det = buscar_produto_detalhe(
-                cur,
-                item.sku or item.referencia,
-                cache,
-                referencia_original=item.referencia_original or item.sku or item.referencia,
-                idioma=None if item.sku else item.idioma,
-                raridade=None if item.sku else item.raridade,
-                sku=item.sku,
-                descricao=item.descricao,
-                clipp_cfg=clipp_cfg,
-                cache_grupo2=cache_grupo2,
-                preco_alvo=item.preco_unitario or None,
-                cache_grupo2_listas=cache_grupo2_listas,
-            )
+        for num, item in enumerate(pedido.itens, start=1):
+            if _e_carta_pokemon(item):
+                det = buscar_produto_pokemon(
+                    cur,
+                    nome=item.descricao or item.referencia_original or "",
+                    numero=int(re.sub(r"\D", "", item.numero or "0") or 0),
+                    total=int(re.sub(r"\D", "", item.total or "0") or 0),
+                    raridade=item.raridade,
+                    preco_alvo=item.preco_unitario or None,
+                    id_grupo=int(clipp_cfg.get("id_grupo_pokemon") or 27),
+                    cache_idx=cache_pokemon,
+                )
+            else:
+                det = buscar_produto_detalhe(
+                    cur,
+                    item.sku or item.referencia,
+                    cache,
+                    referencia_original=item.referencia_original or item.sku or item.referencia,
+                    idioma=None if item.sku else item.idioma,
+                    raridade=None if item.sku else item.raridade,
+                    sku=item.sku,
+                    descricao=item.descricao,
+                    clipp_cfg=clipp_cfg,
+                    cache_grupo2=cache_grupo2,
+                    preco_alvo=item.preco_unitario or None,
+                    cache_grupo2_listas=cache_grupo2_listas,
+                    reprint=item.reprint,
+                )
             if det:
                 ref_clipp = det.get("_referencia_clipp")
                 if ref_clipp:
@@ -2656,9 +3613,8 @@ def vincular_produtos_pedido(con, pedido: PedidoExtraido) -> list[ItemFaltante]:
                 item.id_identificador = det["id_identificador"]
                 _aplicar_preco_estoque(item, det)
             else:
-                ref = (item.referencia or item.sku or "").strip().upper()
-                chave = ref or (item.referencia_original or "").strip().upper()
-                if chave and chave not in faltantes_refs:
+                chave = _chave_item_faltante(item, num)
+                if chave not in faltantes_refs:
                     faltantes_refs.add(chave)
                     faltantes.append(_item_faltante_de_pedido(item))
     finally:
@@ -2921,6 +3877,10 @@ def reverter_reserva_nf_numero(cur, gen_cfg: dict, nf_numero_usado: int) -> None
         )
 
 
+# ---------------------------------------------------------------------------
+# Desfazer importação — remove venda/itens e reverte alterações no cliente
+# ---------------------------------------------------------------------------
+
 def desfazer_importacao(
     con,
     registro: RegistroDesfazer,
@@ -3059,6 +4019,7 @@ def inserir_itens(
                 cache_grupo2=cache_grupo2,
                 preco_alvo=item.preco_unitario or None,
                 cache_grupo2_listas=cache_grupo2_listas,
+                reprint=item.reprint,
             )
             if det:
                 ref_clipp = det.get("_referencia_clipp")
@@ -3072,8 +4033,8 @@ def inserir_itens(
             id_prod = None
 
         if not id_prod:
-            chave = ref or (item.referencia_original or "").strip().upper()
-            if chave and chave not in faltantes_refs:
+            chave = _chave_item_faltante(item, num)
+            if chave not in faltantes_refs:
                 faltantes_refs.add(chave)
                 faltantes.append(_item_faltante_de_pedido(item))
             if on_log and log_detalhe:
@@ -3084,9 +4045,14 @@ def inserir_itens(
             continue
 
         _aplicar_preco_estoque(item, det)
+        det = _campos_item_nfvenda(cur, id_prod, det)
         vlr_unit = item.preco_unitario
         vlr_total = item.preco_total or item.quantidade * vlr_unit
         prod_nome = ((det or {}).get("prod_serv") or item.descricao or "")[:60]
+        prc_custo = float(det.get("prc_custo") or 0)
+        prc_lista = float(det.get("prc_venda") or vlr_unit or 0)
+        conversor = float(det.get("conversor") or 1)
+        uni_medida = str(det.get("uni_medida") or "UN").strip() or "UN"
 
         id_nfvitem = proximo_id
         proximo_id += 1
@@ -3094,8 +4060,15 @@ def inserir_itens(
             """
             INSERT INTO TB_NFV_ITEM_2 (
                 ID_NFVITEM, ID_NFVENDA, ID_IDENTIFICADOR, QTD_ITEM, VLR_UNIT, VLR_TOTAL,
-                CFOP, NUM_ITEM, VLR_FRETE, INCLUIR_FATURA, PRODNOME, UNI_MEDIDA
-            ) VALUES (?, ?, ?, ?, ?, ?, '5102', ?, 0, 'S', ?, 'UN')
+                CFOP, NUM_ITEM, VLR_FRETE, INCLUIR_FATURA, PRODNOME, UNI_MEDIDA,
+                VLR_DESC, VLR_CUSTO, CONVERSOR, VLR_IPI, VLR_ICMS, VLR_COFINS, VLR_PIS,
+                VLR_ST, VLR_SEGURO, VLR_DESPESA, PRODLIQDE, EST_BX, IDSER, BARRA
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?,
+                '5102', ?, 0, 'S', ?, ?,
+                0, ?, ?, 0, 0, 0, 0, 0,
+                0, 0, ?, 'S', 0, ''
+            )
             """,
             (
                 id_nfvitem,
@@ -3106,6 +4079,10 @@ def inserir_itens(
                 vlr_total,
                 num,
                 prod_nome or None,
+                uni_medida,
+                prc_custo,
+                conversor,
+                prc_lista,
             ),
         )
         ultimo_id_item = id_nfvitem
@@ -3129,6 +4106,104 @@ def inserir_itens(
 
     return faltantes, ultimo_id_item, ids_inseridos
 
+
+def inserir_item_resolvido_venda(
+    db_config: dict,
+    id_venda: int,
+    item_data: dict,
+    id_identificador: int,
+    on_log: Callable[[str], None] | None = None,
+) -> dict:
+    """Grava na venda um item que o usuário escolheu manualmente na extensão."""
+    def log(msg: str) -> None:
+        if on_log:
+            on_log(msg)
+
+    qtd = int(item_data.get("quantidade") or 1)
+    pu = float(item_data.get("preco_unitario") or 0)
+    pt = float(item_data.get("preco_total") or 0) or qtd * pu
+    item = ItemPedido(
+        quantidade=qtd,
+        referencia_original=(
+            item_data.get("referencia_site") or item_data.get("referencia") or ""
+        ),
+        referencia=item_data.get("referencia") or "",
+        preco_unitario=pu,
+        preco_total=pt,
+        id_identificador=int(id_identificador),
+        descricao=item_data.get("descricao") or "",
+        idioma=item_data.get("idioma"),
+        raridade=item_data.get("raridade"),
+        sku=item_data.get("sku"),
+        reprint=bool(item_data.get("reprint")),
+    )
+
+    con = conectar(db_config)
+    cur = con.cursor()
+    ok = False
+    id_cliente: int | None = None
+    try:
+        cur.execute(
+            """
+            SELECT COALESCE(VLR_BC_FRETE, 0), COALESCE(DESCONTO, 0), ID_CLIENTE
+            FROM TB_NFVENDA_2
+            WHERE ID_NFVENDA = ?
+            """,
+            (int(id_venda),),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(f"Venda #{id_venda} não encontrada.")
+        vlr_frete = float(row[0] or 0)
+        vlr_desconto = float(row[1] or 0)
+        id_cliente = int(row[2])
+
+        faltantes, _ultimo, ids = inserir_itens(cur, int(id_venda), [item], on_log=on_log)
+        if faltantes:
+            raise RuntimeError("Não foi possível gravar o item escolhido na venda.")
+        _sincronizar_totais_venda(cur, int(id_venda), vlr_frete, vlr_desconto)
+        _finalizar_gravacao_visivel_clipp(
+            con,
+            cur,
+            log,
+            id_cliente=id_cliente,
+            id_venda=int(id_venda),
+            contexto="item resolvido manualmente",
+        )
+        ok = True
+        ref = item.referencia or item.referencia_original or "?"
+        log(
+            f"Item manual gravado na venda #{id_venda}: "
+            f"{ref} → ID {id_identificador}, qtd={qtd}, R$ {pu:.2f}"
+        )
+        return {
+            "ok": True,
+            "mensagem": f"Item gravado na venda #{id_venda} (ID produto {id_identificador}).",
+            "id_venda": int(id_venda),
+            "ids_itens": ids,
+        }
+    except Exception as exc:
+        try:
+            con.rollback()
+        except fdb.Error:
+            pass
+        log(f"ERRO ao gravar item manual: {exc}")
+        return {"ok": False, "mensagem": str(exc)}
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+        if ok:
+            _pulso_visibilidade_clipp(
+                db_config,
+                id_cliente=id_cliente if ok else None,
+                id_venda=int(id_venda),
+                on_log=on_log,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Importação completa via PDF/OCR — interface usada por aplicacao_vendas.py
+# ---------------------------------------------------------------------------
 
 def importar_pedido(
     db_config: dict,
@@ -3203,18 +4278,21 @@ def importar_pedido(
         etapa()
 
         msg = f"Venda #{id_venda} importada (NF nº {nf_numero}, cliente #{id_cliente})."
+        arquivo_faltantes: str | None = None
         if nao_encontrados:
             msg += (
                 f" {len(nao_encontrados)} item(ns) não encontrado(s) "
                 f"(R$ {sum(i.preco_total for i in nao_encontrados):.2f} para lançar manualmente)."
             )
-            abrir_bloco_notas_faltantes(
+            caminho = abrir_bloco_notas_faltantes(
                 nao_encontrados,
                 numero_pedido=pedido.numero_pedido or pedido.arquivo,
                 id_venda=id_venda,
                 nf_numero=nf_numero,
                 on_log=on_log,
             )
+            if caminho:
+                arquivo_faltantes = str(caminho)
         return ResultadoImportacao(
             arquivo=pedido.arquivo,
             sucesso=True,
@@ -3222,6 +4300,7 @@ def importar_pedido(
             id_cliente=id_cliente,
             mensagem=msg,
             itens_nao_encontrados=nao_encontrados or None,
+            arquivo_faltantes=arquivo_faltantes,
             desfazer=registro_atual(),
         )
     except Exception as exc:
@@ -3242,3 +4321,758 @@ def importar_pedido(
             mensagem=f"{exc}{extra}",
             desfazer=desf,
         )
+
+
+# ---------------------------------------------------------------------------
+# Fila de etiquetas dos Correios (XX_TB_ETIQUETA_CORREIO)
+# Listagem, pré-postagem, embalagens, rastreio e aba Financeiro (VL_POSTAGEM)
+# ---------------------------------------------------------------------------
+
+ETIQUETA_STATUS_PADRAO = [
+    ("PENDENTE", "Pendente de impressão"),
+    ("PROCESSANDO", "Processando"),
+    ("GERADA", "Etiqueta gerada"),
+    ("IMPRESSO", "Impresso"),
+    ("POSTADO", "Postado nos Correios"),
+    ("ENTREGUE", "Objeto entregue"),
+    ("ERRO", "Erro ao gerar"),
+    ("CANCELADA", "Cancelada"),
+]
+
+
+def listar_status_etiqueta(db_cfg: dict) -> list[dict]:
+    """Domínio de status (XX_TB_ETQ_STATUS), ordenado por ORDEM."""
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        cur.execute(
+            "SELECT TRIM(CODIGO), TRIM(DESCRICAO) FROM XX_TB_ETQ_STATUS ORDER BY ORDEM"
+        )
+        linhas = [{"codigo": r[0], "descricao": r[1]} for r in cur.fetchall()]
+        return linhas or [
+            {"codigo": c, "descricao": d} for c, d in ETIQUETA_STATUS_PADRAO
+        ]
+    except fdb.Error:
+        return [{"codigo": c, "descricao": d} for c, d in ETIQUETA_STATUS_PADRAO]
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def listar_etiquetas_correio(
+    db_cfg: dict,
+    *,
+    status: str | None = None,
+    busca: str | None = None,
+    limite: int = 1000,
+) -> list[dict]:
+    """Lê a fila XX_TB_ETIQUETA_CORREIO com cliente e destino (cidade/UF)."""
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        sql = [
+            f"SELECT FIRST {int(limite)}",
+            "  E.ID_ETIQUETA, E.ID_NFVENDA, E.ID_CLIENTE, E.CHAVE_ACESSO,",
+            "  E.NF_NUMERO, E.NF_SERIE, TRIM(E.STATUS), S.DESCRICAO,",
+            "  E.COD_SERVICO, E.ID_PREPOSTAGEM, E.COD_RASTREIO, E.ARQUIVO_ETIQUETA,",
+            "  E.MENSAGEM_ERRO, E.DT_INCLUSAO, E.DT_GERACAO, E.DT_IMPRESSAO,",
+            "  C.NOME, CID.NOME, CID.SIGLA_UF, V.INF_COMP_EDIT,",
+            "  E.DT_POSTAGEM, E.DT_PREVISTA, E.DT_ENTREGA,",
+            "  E.PESO, E.COMPRIMENTO, E.LARGURA, E.ALTURA, E.ID_EMB",
+            "FROM XX_TB_ETIQUETA_CORREIO E",
+            "LEFT JOIN XX_TB_ETQ_STATUS S ON S.CODIGO = E.STATUS",
+            "LEFT JOIN TB_CLIENTE C ON C.ID_CLIENTE = E.ID_CLIENTE",
+            "LEFT JOIN TB_CIDADE_SIS CID ON CID.ID_CIDADE = C.ID_CIDADE",
+            "LEFT JOIN TB_NFVENDA V ON V.ID_NFVENDA = E.ID_NFVENDA",
+        ]
+        where: list[str] = []
+        params: list = []
+        if status and status != "Todos":
+            where.append("E.STATUS = ?")
+            params.append(status)
+        if busca and busca.strip():
+            termo = f"%{busca.strip()}%"
+            where.append(
+                "(E.CHAVE_ACESSO LIKE ? OR UPPER(C.NOME) LIKE UPPER(?) "
+                "OR CAST(E.NF_NUMERO AS VARCHAR(20)) LIKE ?)"
+            )
+            params.extend([termo, termo, termo])
+        if where:
+            sql.append("WHERE " + " AND ".join(where))
+        sql.append("ORDER BY E.ID_ETIQUETA DESC")
+        cur.execute("\n".join(sql), params)
+
+        out: list[dict] = []
+        for r in cur.fetchall():
+            cidade = (r[17] or "").strip()
+            uf = (r[18] or "").strip()
+            destino = f"{cidade} - {uf}" if cidade and uf else (cidade or uf or "")
+            out.append(
+                {
+                    "id_etiqueta": int(r[0]),
+                    "id_nfvenda": int(r[1]) if r[1] is not None else None,
+                    "id_cliente": int(r[2]) if r[2] is not None else None,
+                    "chave_acesso": (r[3] or "").strip(),
+                    "nf_numero": r[4],
+                    "nf_serie": (r[5] or "").strip(),
+                    "status": (r[6] or "").strip(),
+                    "status_desc": (r[7] or "").strip() or (r[6] or "").strip(),
+                    "cod_servico": (r[8] or "").strip(),
+                    "id_prepostagem": (r[9] or "").strip(),
+                    "cod_rastreio": (r[10] or "").strip(),
+                    "arquivo_etiqueta": (r[11] or "").strip(),
+                    "mensagem_erro": (r[12] or "").strip(),
+                    "dt_inclusao": r[13],
+                    "dt_geracao": r[14],
+                    "dt_impressao": r[15],
+                    "cliente_nome": (r[16] or "").strip(),
+                    "destino": destino,
+                    "envio_obs": (parse_observacao_nota(str(r[19])).get("envio")
+                                  if r[19] else ""),
+                    "dt_postagem": r[20],
+                    "dt_prevista": r[21],
+                    "dt_entrega": r[22],
+                    "peso": r[23],
+                    "comprimento": r[24],
+                    "largura": r[25],
+                    "altura": r[26],
+                    "id_emb": int(r[27]) if r[27] is not None else None,
+                }
+            )
+        return out
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def _row_embalagem(r) -> dict:
+    return {
+        "id_emb": int(r[0]),
+        "nome": (r[1] or "").strip(),
+        "codigo": (r[2] or "").strip(),
+        "comprimento": r[3],
+        "largura": r[4],
+        "altura": r[5],
+        "peso_tara": r[6],
+        "formato": (r[7] or "2").strip(),
+        "ativo": (r[8] or "S").strip().upper(),
+        "padrao": (r[9] or "N").strip().upper(),
+        "ordem": int(r[10] or 0),
+    }
+
+
+_EMB_SELECT = (
+    "SELECT ID_EMB, NOME, CODIGO, COMPRIMENTO, LARGURA, ALTURA, PESO_TARA, "
+    "FORMATO, ATIVO, PADRAO, ORDEM FROM XX_TB_EMB_CORREIO"
+)
+
+
+def listar_embalagens(db_cfg: dict, *, somente_ativas: bool = False) -> list[dict]:
+    """Lista as embalagens cadastradas (ordenadas por ORDEM, NOME)."""
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        sql = _EMB_SELECT
+        if somente_ativas:
+            sql += " WHERE ATIVO = 'S'"
+        sql += " ORDER BY ORDEM, NOME"
+        cur.execute(sql)
+        return [_row_embalagem(r) for r in cur.fetchall()]
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def obter_embalagem(db_cfg: dict, id_emb: int) -> dict | None:
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        cur.execute(f"{_EMB_SELECT} WHERE ID_EMB = ?", (int(id_emb),))
+        row = cur.fetchone()
+        return _row_embalagem(row) if row else None
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def salvar_embalagem(db_cfg: dict, dados: dict, id_emb: int | None = None) -> int:
+    """Insere ou atualiza uma embalagem. Retorna o ID. Garante PADRAO único."""
+    def _num(v):
+        try:
+            return float(str(v).replace(",", ".")) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    nome = (dados.get("nome") or "").strip()[:60]
+    if not nome:
+        raise ValueError("Informe o nome da embalagem.")
+    codigo = (dados.get("codigo") or "").strip()[:20] or None
+    compr = _num(dados.get("comprimento"))
+    larg = _num(dados.get("largura"))
+    alt = _num(dados.get("altura"))
+    tara = _num(dados.get("peso_tara"))
+    formato = (str(dados.get("formato") or "2").strip() or "2")[:1]
+    ativo = "S" if str(dados.get("ativo", "S")).strip().upper() in ("S", "1", "TRUE") else "N"
+    padrao = "S" if str(dados.get("padrao", "N")).strip().upper() in ("S", "1", "TRUE") else "N"
+    try:
+        ordem = int(dados.get("ordem") or 0)
+    except (TypeError, ValueError):
+        ordem = 0
+
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        if id_emb:
+            cur.execute(
+                "UPDATE XX_TB_EMB_CORREIO SET NOME=?, CODIGO=?, COMPRIMENTO=?, "
+                "LARGURA=?, ALTURA=?, PESO_TARA=?, FORMATO=?, ATIVO=?, PADRAO=?, "
+                "ORDEM=?, DT_ATUALIZACAO=CURRENT_TIMESTAMP WHERE ID_EMB=?",
+                (nome, codigo, compr, larg, alt, tara, formato, ativo, padrao,
+                 ordem, int(id_emb)),
+            )
+            novo_id = int(id_emb)
+        else:
+            cur.execute(
+                "INSERT INTO XX_TB_EMB_CORREIO (NOME, CODIGO, COMPRIMENTO, LARGURA, "
+                "ALTURA, PESO_TARA, FORMATO, ATIVO, PADRAO, ORDEM) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ID_EMB",
+                (nome, codigo, compr, larg, alt, tara, formato, ativo, padrao, ordem),
+            )
+            novo_id = int(cur.fetchone()[0])
+        if padrao == "S":
+            cur.execute(
+                "UPDATE XX_TB_EMB_CORREIO SET PADRAO='N' WHERE ID_EMB <> ?",
+                (novo_id,),
+            )
+        con.commit()
+        return novo_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def excluir_embalagem(db_cfg: dict, id_emb: int) -> None:
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        cur.execute("DELETE FROM XX_TB_EMB_CORREIO WHERE ID_EMB = ?", (int(id_emb),))
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def obter_destinatario_etiqueta(db_cfg: dict, id_etiqueta: int) -> dict | None:
+    """Destinatário completo de uma etiqueta, pronto para a pré-postagem.
+
+    Junta XX_TB_ETIQUETA_CORREIO + TB_CLIENTE + TB_CIDADE_SIS e busca CPF/CNPJ
+    em TB_CLI_PF/PJ. Devolve também peso/dimensões já gravados (se houver).
+    """
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT
+                E.ID_ETIQUETA, E.ID_NFVENDA, E.ID_CLIENTE, E.NF_NUMERO,
+                TRIM(E.STATUS), E.COD_SERVICO,
+                E.PESO, E.ALTURA, E.LARGURA, E.COMPRIMENTO,
+                C.NOME, C.END_CEP, C.END_TIPO, C.END_LOGRAD, C.END_NUMERO,
+                C.END_BAIRRO, C.END_COMPLE, C.DDD_CELUL, C.FONE_CELUL,
+                CID.NOME, CID.SIGLA_UF
+            FROM XX_TB_ETIQUETA_CORREIO E
+            LEFT JOIN TB_CLIENTE C ON C.ID_CLIENTE = E.ID_CLIENTE
+            LEFT JOIN TB_CIDADE_SIS CID ON CID.ID_CIDADE = C.ID_CIDADE
+            WHERE E.ID_ETIQUETA = ?
+            """,
+            (int(id_etiqueta),),
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+
+        id_cliente = int(r[2]) if r[2] is not None else None
+        cpf_cnpj = ""
+        if id_cliente is not None:
+            cur.execute(
+                "SELECT TRIM(CPF) FROM TB_CLI_PF WHERE ID_CLIENTE = ?", (id_cliente,)
+            )
+            pf = cur.fetchone()
+            if pf and pf[0]:
+                cpf_cnpj = pf[0].strip()
+            else:
+                cur.execute(
+                    "SELECT TRIM(CNPJ) FROM TB_CLI_PJ WHERE ID_CLIENTE = ?",
+                    (id_cliente,),
+                )
+                pj = cur.fetchone()
+                if pj and pj[0]:
+                    cpf_cnpj = pj[0].strip()
+
+        tipo = (r[12] or "").strip()
+        logr = (r[13] or "").strip()
+        logradouro = f"{tipo} {logr}".strip() if tipo else logr
+        ddd = (r[17] or "").strip()
+        fone = (r[18] or "").strip().replace(" ", "")
+
+        return {
+            "id_etiqueta": int(r[0]),
+            "id_nfvenda": int(r[1]) if r[1] is not None else None,
+            "id_cliente": id_cliente,
+            "nf_numero": r[3],
+            "status": (r[4] or "").strip(),
+            "cod_servico": (r[5] or "").strip(),
+            "peso": r[6],
+            "altura": r[7],
+            "largura": r[8],
+            "comprimento": r[9],
+            # destinatário no formato esperado por correios_api.montar_destinatario
+            "nome": (r[10] or "").strip(),
+            "cep": (r[11] or "").strip(),
+            "logradouro": logradouro,
+            "numero": (r[14] or "").strip(),
+            "bairro": (r[15] or "").strip(),
+            "complemento": (r[16] or "").strip(),
+            "cidade": (r[19] or "").strip(),
+            "uf": (r[20] or "").strip(),
+            "celular": (ddd + fone) if fone else "",
+            "cpfCnpj": cpf_cnpj,
+        }
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def atualizar_parametros_etiqueta(
+    db_cfg: dict,
+    id_etiqueta: int,
+    *,
+    cod_servico: str | None = None,
+    peso: float | None = None,
+    id_emb: int | None = None,
+    limpar_emb: bool = False,
+) -> None:
+    """Atualiza serviço/peso/embalagem informados na grade (sem mudar status)."""
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        sets = ["DT_ATUALIZACAO = CURRENT_TIMESTAMP"]
+        params: list = []
+        if cod_servico is not None:
+            sets.append("COD_SERVICO = ?")
+            params.append(cod_servico.strip() or None)
+        if peso is not None:
+            sets.append("PESO = ?")
+            params.append(float(peso) if float(peso) > 0 else None)
+        if limpar_emb:
+            sets.append("ID_EMB = NULL")
+        elif id_emb is not None:
+            sets.append("ID_EMB = ?")
+            params.append(int(id_emb))
+        if len(sets) == 1:
+            return
+        params.append(int(id_etiqueta))
+        cur.execute(
+            f"UPDATE XX_TB_ETIQUETA_CORREIO SET {', '.join(sets)} WHERE ID_ETIQUETA = ?",
+            params,
+        )
+        con.commit()
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def obter_mes_ultima_postagem(db_cfg: dict) -> tuple[int, int] | None:
+    """Retorna (ano, mês) da postagem mais recente, ou None."""
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT FIRST 1
+                   EXTRACT(YEAR FROM COALESCE(E.DT_POSTAGEM, E.DT_GERACAO, E.DT_INCLUSAO)),
+                   EXTRACT(MONTH FROM COALESCE(E.DT_POSTAGEM, E.DT_GERACAO, E.DT_INCLUSAO))
+            FROM XX_TB_ETIQUETA_CORREIO E
+            WHERE E.STATUS IN ('POSTADO', 'ENTREGUE')
+            ORDER BY COALESCE(E.DT_POSTAGEM, E.DT_GERACAO, E.DT_INCLUSAO) DESC
+            """
+        )
+        row = cur.fetchone()
+        if not row or row[0] is None or row[1] is None:
+            return None
+        return int(row[0]), int(row[1])
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def buscar_e_gravar_valor_postagem(
+    db_cfg: dict,
+    id_etiqueta: int,
+    codigo_objeto: str,
+    *,
+    cliente=None,
+    dt_postagem_fallback=None,
+) -> float | None:
+    """Consulta valorAtendimento na API e grava VL_POSTAGEM. Retorna o valor ou None."""
+    import correios_api as _api
+
+    cod = (codigo_objeto or "").strip()
+    if not cod:
+        return None
+    cli = cliente or _api.CorreiosClient()
+    try:
+        mov = cli.consultar_postagem(cod)
+    except Exception:  # noqa: BLE001
+        return None
+    if not mov or mov.get("valor_atendimento") is None:
+        return None
+    valor = float(mov["valor_atendimento"])
+    try:
+        atualizar_valor_postagem(
+            db_cfg, id_etiqueta,
+            vl_postagem=valor,
+            dt_postagem=mov.get("data_postagem") or dt_postagem_fallback,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return valor
+
+
+def listar_financeiro_correio(
+    db_cfg: dict,
+    *,
+    ano: int,
+    mes: int,
+) -> list[dict]:
+    """Etiquetas postadas/entregues no mês (por DT_POSTAGEM) para o financeiro."""
+    import calendar
+
+    ultimo = calendar.monthrange(int(ano), int(mes))[1]
+    dt_ini = date(int(ano), int(mes), 1)
+    dt_fim_excl = date(int(ano), int(mes), ultimo) + timedelta(days=1)
+
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT E.ID_ETIQUETA, E.NF_NUMERO, E.COD_RASTREIO, E.COD_SERVICO,
+                   E.STATUS, S.DESCRICAO, E.DT_POSTAGEM, E.VL_POSTAGEM,
+                   C.NOME, CID.NOME, CID.SIGLA_UF
+            FROM XX_TB_ETIQUETA_CORREIO E
+            LEFT JOIN XX_TB_ETQ_STATUS S ON S.CODIGO = E.STATUS
+            LEFT JOIN TB_CLIENTE C ON C.ID_CLIENTE = E.ID_CLIENTE
+            LEFT JOIN TB_CIDADE_SIS CID ON CID.ID_CIDADE = C.ID_CIDADE
+            WHERE E.STATUS IN ('POSTADO', 'ENTREGUE')
+              AND COALESCE(E.DT_POSTAGEM, E.DT_GERACAO, E.DT_INCLUSAO) >= ?
+              AND COALESCE(E.DT_POSTAGEM, E.DT_GERACAO, E.DT_INCLUSAO) < ?
+            ORDER BY COALESCE(E.DT_POSTAGEM, E.DT_GERACAO, E.DT_INCLUSAO) DESC,
+                     E.ID_ETIQUETA DESC
+            """,
+            (dt_ini, dt_fim_excl),
+        )
+        out: list[dict] = []
+        for r in cur.fetchall():
+            cidade = (r[9] or "").strip()
+            uf = (r[10] or "").strip()
+            destino = f"{cidade} - {uf}" if cidade and uf else (cidade or uf or "")
+            out.append({
+                "id_etiqueta": int(r[0]),
+                "nf_numero": r[1],
+                "cod_rastreio": (r[2] or "").strip(),
+                "cod_servico": (r[3] or "").strip(),
+                "status": (r[4] or "").strip(),
+                "status_desc": (r[5] or "").strip() or (r[4] or "").strip(),
+                "dt_postagem": r[6],
+                "vl_postagem": float(r[7]) if r[7] is not None else None,
+                "cliente_nome": (r[8] or "").strip(),
+                "destino": destino,
+            })
+        return out
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def listar_etiquetas_sem_valor_postagem(db_cfg: dict, *, limite: int = 500) -> list[dict]:
+    """Postadas/entregues ainda sem VL_POSTAGEM gravado (para sincronizar)."""
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        cur.execute(
+            f"""
+            SELECT FIRST {int(limite)}
+                   E.ID_ETIQUETA, E.NF_NUMERO, E.COD_RASTREIO, E.DT_POSTAGEM
+            FROM XX_TB_ETIQUETA_CORREIO E
+            WHERE E.STATUS IN ('POSTADO', 'ENTREGUE')
+              AND (E.VL_POSTAGEM IS NULL OR E.VL_POSTAGEM = 0)
+              AND COALESCE(TRIM(E.COD_RASTREIO), '') <> ''
+            ORDER BY E.DT_POSTAGEM DESC, E.ID_ETIQUETA DESC
+            """
+        )
+        return [
+            {
+                "id_etiqueta": int(r[0]),
+                "nf_numero": r[1],
+                "cod_rastreio": (r[2] or "").strip(),
+                "dt_postagem": r[3],
+            }
+            for r in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def atualizar_valor_postagem(
+    db_cfg: dict,
+    id_etiqueta: int,
+    *,
+    vl_postagem: float,
+    dt_postagem=None,
+) -> None:
+    """Grava valor tarifado (valorAtendimento) da API postada."""
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        sets = ["VL_POSTAGEM = ?", "DT_ATUALIZACAO = CURRENT_TIMESTAMP"]
+        params: list = [float(vl_postagem)]
+        if dt_postagem is not None:
+            sets.append("DT_POSTAGEM = ?")
+            params.append(dt_postagem)
+        params.append(int(id_etiqueta))
+        cur.execute(
+            f"UPDATE XX_TB_ETIQUETA_CORREIO SET {', '.join(sets)} WHERE ID_ETIQUETA = ?",
+            params,
+        )
+        con.commit()
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def atualizar_etiqueta_prepostagem(
+    db_cfg: dict,
+    id_etiqueta: int,
+    *,
+    status: str,
+    id_prepostagem: str | None = None,
+    cod_rastreio: str | None = None,
+    cod_servico: str | None = None,
+    peso: float | None = None,
+    altura: float | None = None,
+    largura: float | None = None,
+    comprimento: float | None = None,
+    arquivo_etiqueta: str | None = None,
+    mensagem_erro: str | None = None,
+    dt_postagem=None,
+    dt_prevista=None,
+    dt_entrega=None,
+    marcar_geracao: bool = False,
+    marcar_impressao: bool = False,
+) -> None:
+    """Grava o resultado da pré-postagem na etiqueta (status, ids, dimensões)."""
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        sets = ["STATUS = ?", "MENSAGEM_ERRO = ?", "DT_ATUALIZACAO = CURRENT_TIMESTAMP"]
+        params: list = [status, (mensagem_erro or None)]
+        campos = {
+            "ID_PREPOSTAGEM": id_prepostagem,
+            "COD_RASTREIO": cod_rastreio,
+            "COD_SERVICO": cod_servico,
+            "PESO": peso,
+            "ALTURA": altura,
+            "LARGURA": largura,
+            "COMPRIMENTO": comprimento,
+            "ARQUIVO_ETIQUETA": arquivo_etiqueta,
+            "DT_POSTAGEM": dt_postagem,
+            "DT_PREVISTA": dt_prevista,
+            "DT_ENTREGA": dt_entrega,
+        }
+        for coluna, valor in campos.items():
+            if valor is not None and valor != "":
+                sets.append(f"{coluna} = ?")
+                params.append(valor)
+        if marcar_geracao:
+            sets.append("DT_GERACAO = CURRENT_TIMESTAMP")
+        if marcar_impressao:
+            sets.append("DT_IMPRESSAO = CURRENT_TIMESTAMP")
+        params.append(int(id_etiqueta))
+        cur.execute(
+            f"UPDATE XX_TB_ETIQUETA_CORREIO SET {', '.join(sets)} WHERE ID_ETIQUETA = ?",
+            params,
+        )
+        con.commit()
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def parse_especie_dimensoes(especie: str) -> dict:
+    """Converte ESPECIE (TB_NFVENDA) em tipo + dimensões.
+
+    Ex.: 'CX20X10X10' -> {'tipo': 'CX', 'comprimento': 20, 'largura': 10, 'altura': 10}
+    (Caixa, 20 de comprimento, 10 de largura, 10 de altura.)
+    O prefixo de letras é o tipo (CX = caixa); os números seguintes, na ordem,
+    são comprimento, largura e altura.
+    """
+    texto = (especie or "").strip().upper()
+    if not texto:
+        return {}
+    m = re.match(r"^([A-Z]+)", texto)
+    tipo = m.group(1) if m else ""
+    resto = texto[len(tipo):]
+    nums = [int(n) for n in re.findall(r"\d+", resto)]
+    out: dict = {"tipo": tipo}
+    rotulos = ("comprimento", "largura", "altura")
+    for i, valor in enumerate(nums[:3]):
+        out[rotulos[i]] = valor
+    return out
+
+
+def parse_observacao_nota(texto: str) -> dict:
+    """Extrai pedido/pagamento/envio da observação da NF (INF_COMP_EDIT).
+
+    Formato esperado: 'Pedido site #11232980 | Pagamento: PIX | Envio: SEDEX'.
+    """
+    t = (texto or "").strip()
+    out: dict = {"numero_pedido": "", "pagamento": "", "envio": ""}
+    if not t:
+        return out
+    m = re.search(r"#\s*(\d+)", t)
+    if m:
+        out["numero_pedido"] = m.group(1)
+    m = re.search(r"Pagamento\s*:\s*([^|\r\n]+)", t, re.IGNORECASE)
+    if m:
+        out["pagamento"] = m.group(1).strip()
+    m = re.search(r"Envio\s*:\s*([^|\r\n]+)", t, re.IGNORECASE)
+    if m:
+        envio = m.group(1).strip()
+        # remove sufixos de cancelamento/data: 'PAC 2026-06-23 - Canc:'
+        envio = re.split(r"\s+\d{4}-\d{2}-\d{2}", envio)[0]
+        envio = re.split(r"\s*-\s*Canc", envio, flags=re.IGNORECASE)[0]
+        out["envio"] = envio.strip()
+    return out
+
+
+def _parse_dav_numero(texto: str) -> int | None:
+    """Extrai o número do DAV da observação da NF (ex.: 'DAV nº 10825')."""
+    m = re.search(r"DAV\s*n?[ºo°.\s]*\s*(\d+)", texto or "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def obter_dados_envio_etiqueta(
+    db_cfg: dict,
+    id_nfvenda: int,
+    *,
+    id_grupo_yugioh: int = 2,
+    id_grupo_pokemon: int = 27,
+) -> dict:
+    """Dados de envio da venda (TB_NFVENDA / TB_NFV_ITEM) para a pré-postagem.
+
+    Retorna declaração de conteúdo (quantidade, jogo, descricao, valor),
+    dimensões (de ESPECIE) e peso em gramas (PES_BRUTO/PES_LIQUID × 1000).
+    """
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        # Itens: quantidade e valor (soma) — TB_NFV_ITEM (etiqueta usa TB_NFVENDA)
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(QTD_ITEM), 0), COALESCE(SUM(VLR_TOTAL), 0)
+            FROM TB_NFV_ITEM WHERE ID_NFVENDA = ?
+            """,
+            (int(id_nfvenda),),
+        )
+        qtd_row = cur.fetchone()
+        quantidade = int(float(qtd_row[0] or 0))
+        valor_total = float(qtd_row[1] or 0)
+
+        # Jogo pelo grupo do produto
+        cur.execute(
+            """
+            SELECT DISTINCT E.ID_GRUPO
+            FROM TB_NFV_ITEM I
+            JOIN V_ESTOQUE_2 E ON E.ID_IDENTIFICADOR = I.ID_IDENTIFICADOR
+            WHERE I.ID_NFVENDA = ?
+            """,
+            (int(id_nfvenda),),
+        )
+        grupos = {int(r[0]) for r in cur.fetchall() if r[0] is not None}
+        tem_yg = id_grupo_yugioh in grupos
+        tem_pk = id_grupo_pokemon in grupos
+        if tem_yg and tem_pk:
+            jogo = "yugioh/pokemon"
+        elif tem_yg:
+            jogo = "yugioh"
+        elif tem_pk:
+            jogo = "pokemon"
+        else:
+            jogo = "colecionáveis"
+
+        # ESPECIE (dimensões), peso (kg -> g) e observação (serviço/pedido/pagamento)
+        cur.execute(
+            "SELECT ESPECIE, PES_LIQUID, PES_BRUTO, INF_COMP_EDIT "
+            "FROM TB_NFVENDA WHERE ID_NFVENDA = ?",
+            (int(id_nfvenda),),
+        )
+        nf = cur.fetchone()
+        especie = (nf[0] or "").strip() if nf else ""
+        pes_liquid = float(nf[1] or 0) if nf else 0.0
+        pes_bruto = float(nf[2] or 0) if nf else 0.0
+        observacao = (str(nf[3]) if nf and nf[3] else "").strip()
+        peso_kg = pes_bruto or pes_liquid
+        peso_g = int(round(peso_kg * 1000)) if peso_kg > 0 else 0
+        dims = parse_especie_dimensoes(especie)
+
+        # Observação do envio: prioriza a da nota; se não tiver Envio:, puxa da
+        # TB_NFVENDA_2 pelo DAV (NF_NUMERO) referenciado na própria observação.
+        obs = parse_observacao_nota(observacao)
+        obs_fonte = "nota" if (obs.get("envio") or obs.get("numero_pedido")) else ""
+        if not obs.get("envio"):
+            dav = _parse_dav_numero(observacao)
+            if dav:
+                cur.execute(
+                    "SELECT FIRST 1 OBS FROM TB_NFVENDA_2 WHERE NF_NUMERO = ? "
+                    "ORDER BY ID_NFVENDA DESC",
+                    (dav,),
+                )
+                g = cur.fetchone()
+                obs2_txt = (str(g[0]) if g and g[0] else "").strip()
+                obs2 = parse_observacao_nota(obs2_txt)
+                if obs2.get("envio") or obs2.get("numero_pedido"):
+                    obs = obs2
+                    observacao = obs2_txt
+                    obs_fonte = f"tb_nfvenda_2 (DAV {dav})"
+
+        unidade = "item" if quantidade == 1 else "itens"
+        descricao = f"{quantidade} {unidade} de {jogo}"
+        return {
+            "quantidade": quantidade,
+            "jogo": jogo,
+            "descricao": descricao,
+            "valor": valor_total,
+            "total_nota": valor_total,
+            "especie": especie,
+            "tipo": dims.get("tipo", ""),
+            "comprimento": dims.get("comprimento"),
+            "largura": dims.get("largura"),
+            "altura": dims.get("altura"),
+            "peso_g": peso_g,
+            "observacao": observacao,
+            "obs_fonte": obs_fonte,
+            "numero_pedido": obs.get("numero_pedido", ""),
+            "pagamento": obs.get("pagamento", ""),
+            "envio": obs.get("envio", ""),
+        }
+    finally:
+        cur.close()
+        _fechar_conexao(con)

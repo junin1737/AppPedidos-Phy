@@ -1,4 +1,5 @@
 config.ini
+config.ini.exemplo
 .rpa_profile/
 .cursor/
 pedidos_rpa.json
@@ -7,10 +8,16 @@ __pycache__/
 .venv/
 *.log
 faltantes/
+etiquetas/
 dados/
 instalador/redist/
 instalador/dist/
 instalador/payload/
 instalador/staging_zip/
+instalador/staging_update/
 fbclient64.dll
 fbclient.dll
+_backup_*/
+_tmp_*
+_tmp_*/
+**/__pycache__/

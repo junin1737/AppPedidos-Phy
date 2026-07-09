@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Tiao Cards → CLIPP",
-  "version": "1.2.1",
+  "version": "1.6.4",
   "description": "Importa o pedido aberto no painel para o CLIPP (Chrome em que você já está logado).",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": ["activeTab", "scripting", "storage", "tabs"],
   "host_permissions": [
     "https://www.tiaocards.com.br/*",
     "https://www.ligamagic.com.br/*",
@@ -12,5 +12,11 @@
   "action": {
     "default_title": "Importar pedido para CLIPP",
     "default_popup": "popup.html"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["relatorio.html", "relatorio.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
 }

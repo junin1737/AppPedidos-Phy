@@ -1,4 +1,4 @@
-"""CLI para testar leitura de PDF sem abrir a interface."""
+"""CLI para testar leitura de PDF sem abrir a interface (parser_pedido.extrair_pedido_pdf)."""
 
 import json
 import sys

@@ -1,4 +1,8 @@
-"""Configuração persistente da aplicação (config.ini)."""
+"""Configuração persistente da aplicação (config.ini).
+
+Centraliza leitura/gravação do INI e expõe helpers (`get_db_config`,
+`get_correios_config`, etc.) usados por servidor, importador e abas Correios.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,7 @@ from pathlib import Path
 CONFIG_FILENAME = "config.ini"
 DEFAULT_DATABASE = r"C:\Work\MT\Cliente\Clipp\Base\CLIPP.FDB"
 
+# Valores padrão quando config.ini não existe ou falta alguma chave.
 DEFAULTS = {
     "firebird": {
         "database": DEFAULT_DATABASE,
@@ -50,11 +55,40 @@ DEFAULTS = {
     },
     "clipp": {
         "id_grupo_yugioh": "2",
+        "id_grupo_pokemon": "27",
         "sets_raridade_grupo2": "RA01,RA02,RA03,RA04",
         "sets_legacy_pt_prefix": "LOB:LDB",
     },
+    "correios": {
+        "ambiente": "producao",
+        "usuario": "",
+        "codigo_acesso": "",
+        "cartao_postagem": "",
+        "contrato": "",
+        "timeout": "30",
+        # Formato do rótulo para impressão (etiqueta térmica)
+        "rotulo_formato": "100x150",
+        # Remetente (loja) — usado na pré-postagem/etiqueta
+        "remetente_nome": "",
+        "remetente_cnpj": "",
+        "remetente_ie": "",
+        "remetente_cep": "",
+        "remetente_logradouro": "",
+        "remetente_numero": "",
+        "remetente_complemento": "",
+        "remetente_bairro": "",
+        "remetente_cidade": "",
+        "remetente_uf": "",
+        "remetente_telefone": "",
+        "remetente_celular": "",
+        "remetente_email": "",
+    },
 }
 
+
+# ---------------------------------------------------------------------------
+# Caminhos do aplicativo (código, dados graváveis, log, controle de pedidos)
+# ---------------------------------------------------------------------------
 
 def app_dir() -> Path:
     return Path(__file__).resolve().parent
@@ -89,6 +123,10 @@ def config_path() -> str:
     return str(app_dir() / CONFIG_FILENAME)
 
 
+# ---------------------------------------------------------------------------
+# Leitura e gravação do config.ini
+# ---------------------------------------------------------------------------
+
 def load_config() -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
     cfg.read_dict(DEFAULTS)
@@ -103,6 +141,10 @@ def save_config(cfg: configparser.ConfigParser) -> None:
     with open(path, "w", encoding="utf-8") as f:
         cfg.write(f)
 
+
+# ---------------------------------------------------------------------------
+# Seções do INI → dicts tipados para cada módulo do projeto
+# ---------------------------------------------------------------------------
 
 def get_db_config(cfg: configparser.ConfigParser | None = None) -> dict:
     if cfg is None:
@@ -173,6 +215,7 @@ def get_clipp_config(cfg: configparser.ConfigParser | None = None) -> dict:
             sets_legacy_pt_prefix[en] = pt
     return {
         "id_grupo_yugioh": int(section.get("id_grupo_yugioh", "2")),
+        "id_grupo_pokemon": int(section.get("id_grupo_pokemon", "27")),
         "sets_grupo2": sets_grupo2,
         "sets_legacy_pt_prefix": sets_legacy_pt_prefix,
     }
@@ -195,6 +238,52 @@ def get_rpa_config(cfg: configparser.ConfigParser | None = None) -> dict:
         "chrome_debug_url": section.get("chrome_debug_url", "").strip(),
     }
 
+
+def get_correios_config(cfg: configparser.ConfigParser | None = None) -> dict:
+    """Credenciais e ambiente da integração Correios API (seção [correios])."""
+    if cfg is None:
+        cfg = load_config()
+    if not cfg.has_section("correios"):
+        section = DEFAULTS["correios"]
+    else:
+        section = cfg["correios"]
+    ambiente = section.get("ambiente", "producao").strip().lower()
+    if ambiente not in ("producao", "homologacao"):
+        ambiente = "producao"
+    try:
+        timeout = int(section.get("timeout", "30"))
+    except (TypeError, ValueError):
+        timeout = 30
+    return {
+        "ambiente": ambiente,
+        "usuario": section.get("usuario", "").strip(),
+        "codigo_acesso": section.get("codigo_acesso", "").strip(),
+        # cartão preserva zeros à esquerda (ex.: 0077180607)
+        "cartao_postagem": section.get("cartao_postagem", "").strip(),
+        "contrato": section.get("contrato", "").strip(),
+        "timeout": timeout,
+        "rotulo_formato": section.get("rotulo_formato", "100x150").strip(),
+        "remetente": {
+            "nome": section.get("remetente_nome", "").strip(),
+            "cnpj": section.get("remetente_cnpj", "").strip(),
+            "ie": section.get("remetente_ie", "").strip(),
+            "cep": section.get("remetente_cep", "").strip(),
+            "logradouro": section.get("remetente_logradouro", "").strip(),
+            "numero": section.get("remetente_numero", "").strip(),
+            "complemento": section.get("remetente_complemento", "").strip(),
+            "bairro": section.get("remetente_bairro", "").strip(),
+            "cidade": section.get("remetente_cidade", "").strip(),
+            "uf": section.get("remetente_uf", "").strip().upper(),
+            "telefone": section.get("remetente_telefone", "").strip(),
+            "celular": section.get("remetente_celular", "").strip(),
+            "email": section.get("remetente_email", "").strip(),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Validação rápida antes de importar ou conectar
+# ---------------------------------------------------------------------------
 
 def is_configured(cfg: configparser.ConfigParser | None = None) -> bool:
     if cfg is None:
