@@ -68,7 +68,10 @@ Na maquina de producao (que JA tem o AppPedidos instalado):
      - Ele encerra o servidor, copia os arquivos novos e reinicia.
      - NAO mexe em config.ini nem nos pedidos ja importados.
   3. No Chrome: abra chrome://extensions e clique em ATUALIZAR (Reload)
-     na extensao "Tiao Cards -> CLIPP" (versao 1.6.4).
+     na extensao "Tiao Cards -> CLIPP".
+
+  4. Nas proximas atualizacoes use o botao "Atualizar do GitHub" no app
+     (aba Servidor ou menu da bandeja) — nao precisa mais deste ZIP.
 
 Se a instalacao nao estiver na pasta padrao, rode pelo PowerShell:
   powershell -ExecutionPolicy Bypass -File atualizar_app.ps1 -Destino "CAMINHO\DA\INSTALACAO"

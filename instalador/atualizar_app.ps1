@@ -126,6 +126,11 @@ foreach ($p in $Pastas) {
         Write-Host "  - $p\ (extensao)"
     }
 }
+$ps1Git = Join-Path $Origem "atualizar_github.ps1"
+if (Test-Path $ps1Git) {
+    Copy-Item -Force $ps1Git (Join-Path $Destino "atualizar_github.ps1")
+    Write-Host "  - atualizar_github.ps1"
+}
 
 # Limpa cache compilado para garantir que o novo codigo rode.
 $pycache = Join-Path $Destino "__pycache__"
