@@ -45,7 +45,21 @@ APP_ICON_PNG = APP_DIR / "app_icon.png"
 # Repositório GitHub — atualização pelo botão «Atualizar do GitHub»
 GITHUB_REPO = "junin1737/AppPedidos-Phy"
 GITHUB_BRANCH = "main"
-SCRIPT_ATUALIZAR_GIT = APP_DIR / "atualizar_github.ps1"
+SCRIPT_ATUALIZAR_GIT = APP_DIR / "atualizar_github.py"
+SCRIPT_ATUALIZAR_GIT_PS1 = APP_DIR / "atualizar_github.ps1"
+
+
+def _pythonw_atualizacao() -> str:
+    """pythonw embutido ou do sistema para abrir a janela de atualização."""
+    embutido = APP_DIR / "python" / "pythonw.exe"
+    if embutido.is_file():
+        return str(embutido)
+    exe = Path(sys.executable)
+    if exe.name.lower() == "python.exe":
+        pyw = exe.with_name("pythonw.exe")
+        if pyw.is_file():
+            return str(pyw)
+    return str(exe)
 
 _servidor_httpd = None
 _servidor_thread: threading.Thread | None = None
@@ -282,69 +296,88 @@ def _recarregar_servico_ui() -> None:
 
 
 def _atualizar_github_ui() -> None:
-    """Baixa a versão mais recente do GitHub, encerra o app e reinicia após copiar."""
+    """Abre janela de progresso, baixa do GitHub e reinicia o app."""
     if not messagebox.askyesno(
         APP_TITLE,
         "Atualizar do GitHub?\n\n"
         f"Repositório: {GITHUB_REPO} ({GITHUB_BRANCH})\n\n"
-        "O aplicativo será encerrado, o código será baixado e o servidor "
-        "será aberto de novo automaticamente.\n\n"
-        "config.ini e pedidos importados não são alterados.\n\n"
-        "Depois, recarregue a extensão Chrome em chrome://extensions.",
+        "Uma janela com barra de progresso será aberta.\n"
+        "O servidor encerra sozinho, aplica a atualização e reabre ao terminar.\n\n"
+        "config.ini e pedidos importados não são alterados.",
         parent=_janela,
     ):
         return
 
-    if not SCRIPT_ATUALIZAR_GIT.is_file():
+    script = SCRIPT_ATUALIZAR_GIT if SCRIPT_ATUALIZAR_GIT.is_file() else SCRIPT_ATUALIZAR_GIT_PS1
+    if not script.is_file():
         messagebox.showerror(
             APP_TITLE,
-            f"Script de atualização não encontrado:\n{SCRIPT_ATUALIZAR_GIT}",
+            "Atualizador não encontrado:\n"
+            f"  {SCRIPT_ATUALIZAR_GIT}\n"
+            f"  {SCRIPT_ATUALIZAR_GIT_PS1}",
             parent=_janela,
         )
         return
 
     logging.info(
-        "Atualização GitHub iniciada — repo=%s branch=%s destino=%s",
+        "Atualização GitHub iniciada — repo=%s branch=%s destino=%s script=%s",
         GITHUB_REPO,
         GITHUB_BRANCH,
         APP_DIR,
+        script.name,
     )
 
-    args = [
-        "powershell.exe",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-WindowStyle",
-        "Hidden",
-        "-File",
-        str(SCRIPT_ATUALIZAR_GIT),
-        "-Destino",
-        str(APP_DIR),
-        "-Repositorio",
-        GITHUB_REPO,
-        "-Branch",
-        GITHUB_BRANCH,
-        "-AguardarSegundos",
-        "3",
-    ]
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        subprocess.Popen(args, cwd=str(APP_DIR), creationflags=flags)
+        if script.suffix.lower() == ".py":
+            subprocess.Popen(
+                [
+                    _pythonw_atualizacao(),
+                    str(script),
+                    "--destino",
+                    str(APP_DIR),
+                    "--repositorio",
+                    GITHUB_REPO,
+                    "--branch",
+                    GITHUB_BRANCH,
+                ],
+                cwd=str(APP_DIR),
+            )
+        else:
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                    "-Destino",
+                    str(APP_DIR),
+                    "-Repositorio",
+                    GITHUB_REPO,
+                    "-Branch",
+                    GITHUB_BRANCH,
+                    "-AguardarSegundos",
+                    "2",
+                ],
+                cwd=str(APP_DIR),
+                creationflags=flags,
+            )
     except OSError as exc:
         logging.error("Falha ao iniciar atualização GitHub: %s", exc)
         messagebox.showerror(APP_TITLE, f"Não foi possível iniciar a atualização:\n{exc}")
         return
 
     if _janela is not None:
-        _janela._lbl_status.config(text="● Atualizando do GitHub…", fg="#ef6c00")
+        _janela._lbl_status.config(text="● Abrindo atualização…", fg="#ef6c00")
         _janela._lbl_detalhe.config(
-            text="Encerrando para aplicar a atualização e reiniciar…"
+            text="Acompanhe o progresso na janela «Atualizando do GitHub»."
         )
         _janela.update_idletasks()
-        _janela.after(400, _sair_app)
+        _janela.after(600, _sair_app)
     else:
-        threading.Timer(0.5, _sair_app).start()
+        threading.Timer(0.6, _sair_app).start()
 
 
 def _limpar_controle_local_ui() -> None:

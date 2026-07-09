@@ -4719,16 +4719,22 @@ def buscar_e_gravar_valor_postagem(
     *,
     cliente=None,
     dt_postagem_fallback=None,
+    id_prepostagem: str | None = None,
 ) -> float | None:
     """Consulta valorAtendimento na API e grava VL_POSTAGEM. Retorna o valor ou None."""
     import correios_api as _api
 
     cod = (codigo_objeto or "").strip()
-    if not cod:
+    if not cod and not (id_prepostagem or "").strip():
         return None
     cli = cliente or _api.CorreiosClient()
     try:
-        mov = cli.consultar_postagem(cod)
+        mov = cli.obter_valor_tarifado(
+            codigo_objeto=cod or None,
+            id_prepostagem=id_prepostagem,
+        )
+    except _api.CorreiosError:
+        raise
     except Exception:  # noqa: BLE001
         return None
     if not mov or mov.get("valor_atendimento") is None:
@@ -4809,11 +4815,15 @@ def listar_etiquetas_sem_valor_postagem(db_cfg: dict, *, limite: int = 500) -> l
         cur.execute(
             f"""
             SELECT FIRST {int(limite)}
-                   E.ID_ETIQUETA, E.NF_NUMERO, E.COD_RASTREIO, E.DT_POSTAGEM
+                   E.ID_ETIQUETA, E.NF_NUMERO, E.COD_RASTREIO, E.DT_POSTAGEM,
+                   E.ID_PREPOSTAGEM
             FROM XX_TB_ETIQUETA_CORREIO E
             WHERE E.STATUS IN ('POSTADO', 'ENTREGUE')
               AND (E.VL_POSTAGEM IS NULL OR E.VL_POSTAGEM = 0)
-              AND COALESCE(TRIM(E.COD_RASTREIO), '') <> ''
+              AND (
+                    COALESCE(TRIM(E.COD_RASTREIO), '') <> ''
+                    OR COALESCE(TRIM(E.ID_PREPOSTAGEM), '') <> ''
+                  )
             ORDER BY E.DT_POSTAGEM DESC, E.ID_ETIQUETA DESC
             """
         )
@@ -4823,6 +4833,7 @@ def listar_etiquetas_sem_valor_postagem(db_cfg: dict, *, limite: int = 500) -> l
                 "nf_numero": r[1],
                 "cod_rastreio": (r[2] or "").strip(),
                 "dt_postagem": r[3],
+                "id_prepostagem": (r[4] or "").strip(),
             }
             for r in cur.fetchall()
         ]

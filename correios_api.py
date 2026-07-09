@@ -269,13 +269,24 @@ class CorreiosClient:
             "Accept": "application/json",
         }
         body = {"numero": self._cfg["cartao_postagem"].strip()}
-        try:
-            resp = self._session.post(
-                url, json=body, headers=headers, timeout=self._timeout
-            )
-        except requests.RequestException as exc:
-            raise CorreiosError(f"Falha de conexão ao gerar token: {exc}") from exc
+        resp: requests.Response | None = None
+        for tentativa in range(3):
+            try:
+                resp = self._session.post(
+                    url, json=body, headers=headers, timeout=self._timeout
+                )
+            except requests.RequestException as exc:
+                if tentativa < 2:
+                    time.sleep(2.0 * (tentativa + 1))
+                    continue
+                raise CorreiosError(f"Falha de conexão ao gerar token: {exc}") from exc
 
+            if resp.status_code in (502, 503, 504) and tentativa < 2:
+                time.sleep(2.0 * (tentativa + 1))
+                continue
+            break
+
+        assert resp is not None
         if resp.status_code not in (200, 201):
             raise CorreiosError(
                 f"Erro ao gerar token ({resp.status_code}): {_mensagem_erro(resp)}",
@@ -319,21 +330,9 @@ class CorreiosClient:
             cabecalhos["Content-Type"] = "application/json"
         if headers:
             cabecalhos.update(headers)
-        try:
-            resp = self._session.request(
-                metodo.upper(),
-                url,
-                params=params,
-                json=json,
-                headers=cabecalhos,
-                timeout=self._timeout,
-            )
-        except requests.RequestException as exc:
-            raise CorreiosError(f"Falha de conexão em {metodo} {path}: {exc}") from exc
 
-        # Token pode ter expirado entre o cache e o uso: tenta renovar uma vez.
-        if resp.status_code in (401, 403):
-            cabecalhos["Authorization"] = f"Bearer {self.obter_token(forcar=True)}"
+        resp: requests.Response | None = None
+        for tentativa in range(3):
             try:
                 resp = self._session.request(
                     metodo.upper(),
@@ -344,9 +343,35 @@ class CorreiosClient:
                     timeout=self._timeout,
                 )
             except requests.RequestException as exc:
+                if tentativa < 2:
+                    time.sleep(2.0 * (tentativa + 1))
+                    continue
                 raise CorreiosError(
-                    f"Falha de conexão (retry) em {metodo} {path}: {exc}"
+                    f"Falha de conexão em {metodo} {path}: {exc}"
                 ) from exc
+
+            if resp.status_code in (502, 503, 504) and tentativa < 2:
+                time.sleep(2.0 * (tentativa + 1))
+                continue
+
+            if resp.status_code in (401, 403):
+                cabecalhos["Authorization"] = f"Bearer {self.obter_token(forcar=True)}"
+                try:
+                    resp = self._session.request(
+                        metodo.upper(),
+                        url,
+                        params=params,
+                        json=json,
+                        headers=cabecalhos,
+                        timeout=self._timeout,
+                    )
+                except requests.RequestException as exc:
+                    raise CorreiosError(
+                        f"Falha de conexão (retry) em {metodo} {path}: {exc}"
+                    ) from exc
+            return resp
+
+        assert resp is not None
         return resp
 
     # --- pré-postagem ---
@@ -759,6 +784,101 @@ class CorreiosClient:
             )
         return True
 
+    def _extrair_valor_dict(self, data: dict | None) -> float | None:
+        """Lê valor tarifado de qualquer dict retornado pela API."""
+        if not isinstance(data, dict):
+            return None
+        for chave in (
+            "valorAtendimento", "valor_atendimento",
+            "valorServico", "valor_servico",
+            "valorDeclarado", "valor",
+        ):
+            bruto = data.get(chave)
+            if bruto is None:
+                continue
+            try:
+                v = float(str(bruto).replace(",", "."))
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _normalizar_item_postada(self, data: Any, cod_fallback: str) -> dict | None:
+        """Aceita dict, lista ou envelope {itens: [...]}."""
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if isinstance(data, dict) and isinstance(data.get("itens"), list):
+            itens = data["itens"]
+            data = itens[0] if itens else None
+        if not isinstance(data, dict):
+            return None
+        valor_f = self._extrair_valor_dict(data)
+        return {
+            "codigo_objeto": (data.get("codigoObjeto") or cod_fallback).strip(),
+            "valor_atendimento": valor_f,
+            "data_postagem": _parse_dt(
+                data.get("dataPostagem") or data.get("dtPostagem")
+            ),
+            "codigo_servico": (data.get("codigoServico") or "").strip(),
+            "nome_servico": (data.get("nomeServico") or "").strip(),
+            "peso_tarifado": data.get("pesoTarifadoObjeto") or data.get("peso"),
+            "numero_atendimento": (data.get("numeroAtendimento") or "").strip(),
+            "raw": data,
+        }
+
+    def obter_valor_tarifado(
+        self,
+        *,
+        codigo_objeto: str | None = None,
+        id_prepostagem: str | None = None,
+    ) -> dict | None:
+        """Busca valor tarifado após postagem (postada v1, depois pré-postagem v2)."""
+        cod = (codigo_objeto or "").strip().upper().replace(" ", "")
+        id_pp = (id_prepostagem or "").strip()
+
+        if cod:
+            resp = self._request(
+                "GET",
+                "/prepostagem/v1/prepostagens/postada",
+                params={"codigoObjeto": cod},
+            )
+            if resp.status_code == 200:
+                try:
+                    mov = self._normalizar_item_postada(resp.json(), cod)
+                except ValueError:
+                    mov = None
+                if mov and mov.get("valor_atendimento") is not None:
+                    return mov
+            elif resp.status_code not in (404,):
+                raise CorreiosError(
+                    f"Erro ao consultar postagem ({resp.status_code}): "
+                    f"{_mensagem_erro(resp)}",
+                    status=resp.status_code,
+                    corpo=resp.text,
+                )
+
+        prep = self.consultar_prepostagem(
+            codigo_objeto=cod or None,
+            id_prepostagem=id_pp or None,
+        )
+        if prep:
+            valor_f = self._extrair_valor_dict(prep)
+            if valor_f is not None:
+                return {
+                    "codigo_objeto": (prep.get("codigoObjeto") or cod).strip(),
+                    "valor_atendimento": valor_f,
+                    "data_postagem": _parse_dt(
+                        prep.get("dataPostagem") or prep.get("dtPostagem")
+                    ),
+                    "codigo_servico": (prep.get("codigoServico") or "").strip(),
+                    "nome_servico": (prep.get("nomeServico") or "").strip(),
+                    "peso_tarifado": prep.get("pesoInformado") or prep.get("peso"),
+                    "numero_atendimento": (prep.get("numeroAtendimento") or "").strip(),
+                    "raw": prep,
+                }
+        return None
+
     def consultar_postagem(self, codigo_objeto: str) -> dict | None:
         """Consulta o movimento de postagem (valor tarifado após postar).
 
@@ -783,23 +903,7 @@ class CorreiosClient:
             data = resp.json()
         except ValueError as exc:
             raise CorreiosError("Resposta da postagem não é JSON válido.") from exc
-        if not isinstance(data, dict):
-            return None
-        valor = data.get("valorAtendimento")
-        try:
-            valor_f = float(valor) if valor is not None else None
-        except (TypeError, ValueError):
-            valor_f = None
-        return {
-            "codigo_objeto": (data.get("codigoObjeto") or cod).strip(),
-            "valor_atendimento": valor_f,
-            "data_postagem": _parse_dt(data.get("dataPostagem")),
-            "codigo_servico": (data.get("codigoServico") or "").strip(),
-            "nome_servico": (data.get("nomeServico") or "").strip(),
-            "peso_tarifado": data.get("pesoTarifadoObjeto"),
-            "numero_atendimento": (data.get("numeroAtendimento") or "").strip(),
-            "raw": data,
-        }
+        return self._normalizar_item_postada(data, cod)
 
     def rastrear(self, codigo_objeto: str, *, resultado: str = "T") -> dict:
         """Consulta o rastreamento de um objeto na API Rastro.

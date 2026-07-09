@@ -364,6 +364,8 @@ class FinanceiroFrame(tk.Frame):
         db_cfg = self._cfg()
 
         def trabalho():
+            import correios_api as _api
+
             try:
                 pendentes = firebird_db.listar_etiquetas_sem_valor_postagem(db_cfg)
             except Exception as exc:  # noqa: BLE001
@@ -371,21 +373,31 @@ class FinanceiroFrame(tk.Frame):
                 return
             ok, falhas = 0, 0
             total = len(pendentes)
+            erro_api: str | None = None
             for i, r in enumerate(pendentes, 1):
                 cod = (r.get("cod_rastreio") or "").strip()
-                if not cod:
+                id_pp = (r.get("id_prepostagem") or "").strip()
+                if not cod and not id_pp:
                     continue
                 self.after(0, lambda i=i, t=total: self.lbl_status.configure(
                     text=f"Buscando valor {i}/{t}...", fg="#1565c0"))
-                v = firebird_db.buscar_e_gravar_valor_postagem(
-                    db_cfg, r["id_etiqueta"], cod,
-                    cliente=cliente, dt_postagem_fallback=r.get("dt_postagem"),
-                )
+                try:
+                    v = firebird_db.buscar_e_gravar_valor_postagem(
+                        db_cfg, r["id_etiqueta"], cod,
+                        cliente=cliente,
+                        dt_postagem_fallback=r.get("dt_postagem"),
+                        id_prepostagem=id_pp or None,
+                    )
+                except _api.CorreiosError as exc:
+                    if erro_api is None:
+                        erro_api = str(exc)
+                    falhas += 1
+                    break
                 if v is not None:
                     ok += 1
                 else:
                     falhas += 1
-            self.after(0, lambda: self._fim_sync(ok, falhas, None, silencioso))
+            self.after(0, lambda: self._fim_sync(ok, falhas, erro_api, silencioso))
 
         threading.Thread(target=trabalho, daemon=True).start()
 
@@ -393,8 +405,31 @@ class FinanceiroFrame(tk.Frame):
                   silencioso: bool = False) -> None:
         self._sincronizando = False
         if erro:
+            msg = erro[:200]
+            self.lbl_status.configure(
+                text=f"Erro na API dos Correios: {msg[:80]}…" if len(msg) > 80 else f"Erro na API: {msg}",
+                fg="#c62828",
+            )
             if not silencioso:
                 messagebox.showerror("Buscar valores", erro, parent=self)
+        elif ok == 0 and falhas > 0:
+            self.lbl_status.configure(
+                text=(
+                    f"Nenhum valor obtido ({falhas} postagem(ns)). "
+                    "Confira credenciais [correios] no config.ini e clique em Buscar valores."
+                ),
+                fg="#c62828",
+            )
+            if not silencioso:
+                messagebox.showwarning(
+                    "Buscar valores",
+                    f"Nenhuma das {falhas} consultas retornou valor.\n\n"
+                    "Possíveis causas:\n"
+                    "• Credenciais [correios] incorretas no config.ini\n"
+                    "• API dos Correios indisponível (timeout)\n"
+                    "• Objeto ainda sem valor tarifado na API",
+                    parent=self,
+                )
         elif not silencioso:
             if ok or falhas:
                 msg = f"{ok} valor(es) atualizado(s)."
@@ -410,6 +445,10 @@ class FinanceiroFrame(tk.Frame):
                     "Nenhuma postagem pendente de valor para buscar.",
                     parent=self,
                 )
+        elif ok > 0:
+            self.lbl_status.configure(
+                text=f"{ok} valor(es) atualizado(s) na API dos Correios", fg="#2e7d32",
+            )
         self.recarregar()
 
 
