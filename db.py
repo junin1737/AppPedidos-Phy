@@ -623,17 +623,27 @@ def _documento_do_cliente(cur, id_cliente: int) -> str:
     return ""
 
 
+_PARTICULAS_NOME = frozenset(
+    {"DA", "DE", "DO", "DAS", "DOS", "E", "DI", "DEL", "VAN", "VON", "LA", "LE"}
+)
+
+
 def _tokens_nome(nome: str) -> list[str]:
-    """Tokens do nome sem acento, em maiúsculas (para comparar similaridade)."""
+    """Tokens do nome sem acento, em maiúsculas (ignora partículas da/de/dos)."""
     base = _sem_acento((nome or "").upper())
-    return [t for t in re.split(r"[^A-Z0-9]+", base) if len(t) >= 3]
+    return [
+        t
+        for t in re.split(r"[^A-Z0-9]+", base)
+        if len(t) >= 3 and t not in _PARTICULAS_NOME
+    ]
 
 
-def buscar_clientes_por_nome(cur, nome: str, limite: int = 20) -> list[dict]:
-    """Clientes com nome parecido, ranqueados por nº de tokens em comum.
+def buscar_clientes_por_nome(cur, nome: str, limite: int = 15) -> list[dict]:
+    """Clientes com nome parecido, ranqueados por similaridade.
 
-    Usado na retirada no balcão, em que a página não traz CPF/CNPJ: o usuário
-    escolhe manualmente qual cliente é o correto.
+    Usado na retirada no balcão (sem CPF/CNPJ). Exige o primeiro nome igual e
+    ao menos outro token em comum (sobrenome/nome do meio), para não listar
+    qualquer «Jesus» ou «Rocha» aleatório.
     """
     nome = (nome or "").strip()
     if not nome or nome.lower() in _NOMES_BLOQUEADOS:
@@ -642,40 +652,61 @@ def buscar_clientes_por_nome(cur, nome: str, limite: int = 20) -> list[dict]:
     if not tokens:
         return []
 
-    # Chaves de busca no banco preservam acento (UPPER(NOME) mantém acento no FB).
-    raw_tokens = [
-        t for t in re.split(r"[^0-9A-Za-zÀ-ÿ]+", nome.upper()) if len(t) >= 3
-    ]
-    chaves = {raw_tokens[0], raw_tokens[-1]} if raw_tokens else {tokens[0]}
-
-    encontrados: dict[int, tuple] = {}
-    for chave in chaves:
+    primeiro = tokens[0]
+    ultimo = tokens[-1] if len(tokens) > 1 else tokens[0]
+    # Busca restrita: primeiro E último token (quando houver os dois).
+    if len(tokens) >= 2 and primeiro != ultimo:
         cur.execute(
             """
-            SELECT FIRST 120 c.ID_CLIENTE, c.NOME,
+            SELECT FIRST 80 c.ID_CLIENTE, c.NOME,
+                   c.DDD_RESID, c.FONE_RESID, c.DDD_COMER, c.FONE_COMER,
+                   c.DDD_CELUL, c.FONE_CELUL
+            FROM TB_CLIENTE c
+            WHERE UPPER(c.NOME) CONTAINING ?
+              AND UPPER(c.NOME) CONTAINING ?
+            ORDER BY c.NOME
+            """,
+            (primeiro, ultimo),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT FIRST 80 c.ID_CLIENTE, c.NOME,
                    c.DDD_RESID, c.FONE_RESID, c.DDD_COMER, c.FONE_COMER,
                    c.DDD_CELUL, c.FONE_CELUL
             FROM TB_CLIENTE c
             WHERE UPPER(c.NOME) CONTAINING ?
             ORDER BY c.NOME
             """,
-            (chave,),
+            (primeiro,),
         )
-        for row in cur.fetchall():
-            encontrados[int(row[0])] = row
+
+    # Mínimo de tokens em comum: nome curto (1–2) exige todos; senão >= 2
+    # e o primeiro nome precisa bater.
+    min_overlap = len(tokens) if len(tokens) <= 2 else 2
 
     ranqueados = []
-    for cid, row in encontrados.items():
-        toks_cli = set(_tokens_nome(row[1] or ""))
-        overlap = sum(1 for t in tokens if t in toks_cli)
-        if not overlap:
+    for row in cur.fetchall():
+        toks_cli = _tokens_nome(row[1] or "")
+        if not toks_cli:
             continue
-        ranqueados.append((overlap, (row[1] or "").strip().upper(), cid, row))
+        # Primeiro nome tem que ser o mesmo (Jesus ≠ Fernando).
+        if toks_cli[0] != primeiro:
+            continue
+        toks_cli_set = set(toks_cli)
+        overlap = sum(1 for t in tokens if t in toks_cli_set)
+        if overlap < min_overlap:
+            continue
+        # Bônus: sobrenome final igual
+        bonus = 1 if len(tokens) > 1 and toks_cli[-1] == ultimo else 0
+        ranqueados.append(
+            (-(overlap + bonus), -overlap, (row[1] or "").strip().upper(), int(row[0]), row)
+        )
 
-    ranqueados.sort(key=lambda x: (-x[0], x[1]))
+    ranqueados.sort()
 
     saida: list[dict] = []
-    for _overlap, _nome_upper, cid, row in ranqueados[:limite]:
+    for _score, _ov, _nome_upper, cid, row in ranqueados[:limite]:
         tels = sorted(_telefones_cliente(row[2:]))
         saida.append(
             {
@@ -689,7 +720,7 @@ def buscar_clientes_por_nome(cur, nome: str, limite: int = 20) -> list[dict]:
 
 
 def listar_clientes_semelhantes(
-    db_config: dict, nome: str, limite: int = 20
+    db_config: dict, nome: str, limite: int = 15
 ) -> list[dict]:
     """Abre conexão e retorna clientes com nome parecido."""
     con = conectar(db_config)
