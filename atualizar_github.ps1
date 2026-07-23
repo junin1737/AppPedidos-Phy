@@ -84,6 +84,7 @@ function Stop-AppPedidosProcessos {
     Write-Log "Encerrando processos do AppPedidos..."
     $ids = [System.Collections.Generic.HashSet[int]]::new()
     $pastas = @($PastasProc | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)
+    $meuPid = $PID
 
     if ($AguardarSegundos -gt 0) {
         Write-Log "Aguardando ${AguardarSegundos}s para o app fechar..."
@@ -95,10 +96,25 @@ function Stop-AppPedidosProcessos {
         Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
             $cmd = $_.CommandLine
             if (-not $cmd) { return }
+            if ($_.ProcessId -eq $meuPid) { return }
+            # Nunca encerrar o próprio atualizador
+            if ($cmd -match 'atualizar_github\.(ps1|py)') { return }
+            if ($cmd -match 'AppPedidosCLIPP-git-') { return }
+
             $fecha = $false
-            if ($cmd -match 'servidor_app\.py|importar_servidor\.py|atualizar_github\.ps1') { $fecha = $true }
-            foreach ($pasta in $pastas) {
-                if ($cmd -like "*$pasta*") { $fecha = $true; break }
+            if ($cmd -match 'servidor_app\.py|importar_servidor\.py') { $fecha = $true }
+            elseif ($cmd -match 'AppPedidos CLIPP\.bat') { $fecha = $true }
+            else {
+                foreach ($pasta in $pastas) {
+                    if (
+                        ($cmd -like "*$pasta*") -and
+                        ($cmd -match 'pythonw?\.exe') -and
+                        ($cmd -notmatch 'atualizar_github')
+                    ) {
+                        $fecha = $true
+                        break
+                    }
+                }
             }
             if (-not $fecha) { return }
             $rodando = $true
@@ -106,6 +122,7 @@ function Stop-AppPedidosProcessos {
                 try {
                     Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
                     [void]$ids.Add([int]$_.ProcessId)
+                    Write-Log "  Encerrado PID $($_.ProcessId)"
                 } catch {}
             }
         }
@@ -119,6 +136,7 @@ function Stop-AppPedidosProcessos {
             if (-not (Test-Path $exe)) { continue }
             Get-Process -Name $nome -ErrorAction SilentlyContinue | ForEach-Object {
                 try {
+                    if ($_.Id -eq $meuPid) { return }
                     if ($_.Path -and ($_.Path -ieq $exe)) {
                         Stop-Process -Id $_.Id -Force -ErrorAction Stop
                         [void]$ids.Add($_.Id)
@@ -169,14 +187,21 @@ try {
     }
     foreach ($p in $Pastas) {
         $src = Join-Path $origem $p
+        $dst = Join-Path $Destino $p
         if (Test-Path $src) {
-            Copy-Item -Recurse -Force $src $Destino
+            if (Test-Path $dst) {
+                Remove-Item -Recurse -Force $dst -ErrorAction SilentlyContinue
+            }
+            Copy-Item -Recurse -Force $src $dst
             Write-Log "  + $p\"
         }
     }
-    $ps1 = Join-Path $origem "atualizar_github.ps1"
-    if (Test-Path $ps1) {
-        Copy-Item -Force $ps1 (Join-Path $Destino "atualizar_github.ps1")
+    foreach ($extra in @("atualizar_github.ps1", "atualizar_github.py")) {
+        $srcExtra = Join-Path $origem $extra
+        if (Test-Path $srcExtra) {
+            Copy-Item -Force $srcExtra (Join-Path $Destino $extra)
+            Write-Log "  + $extra"
+        }
     }
 
     $pycache = Join-Path $Destino "__pycache__"

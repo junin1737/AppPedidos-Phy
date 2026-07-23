@@ -87,16 +87,32 @@ def _reexecutar_como_admin(argv: list[str]) -> None:
 
 
 def _comando_envolve_app(cmd: str, pastas: list[Path]) -> bool:
+    """True se o processo é o app (servidor), não o atualizador."""
     if not cmd:
         return False
     cmd_l = cmd.lower()
+    # Nunca encerrar o próprio atualizador (python ou powershell).
+    if "atualizar_github.py" in cmd_l or "atualizar_github.ps1" in cmd_l:
+        return False
+    if "apppedidosclipp-git-" in cmd_l:
+        return False
     if "servidor_app.py" in cmd_l or "importar_servidor.py" in cmd_l:
         return True
-    if "atualizar_github.py" in cmd_l and "atualizar_github.ps1" not in cmd_l:
-        # outro processo de atualização
-        return False
     for pasta in pastas:
-        if str(pasta).lower() in cmd_l:
+        p = str(pasta).lower()
+        if not p:
+            continue
+        # Só considera se o executável/script está NA pasta do app
+        # (evita matar o atualizador só porque --destino aponta para lá).
+        if p in cmd_l and (
+            "pythonw.exe" in cmd_l
+            or "python.exe" in cmd_l
+            or "servidor_app.py" in cmd_l
+            or "apppedidos clipp.bat" in cmd_l
+        ):
+            # Ainda assim exclui se for o script de atualização
+            if "atualizar_github" in cmd_l:
+                return False
             return True
     return False
 
@@ -108,31 +124,68 @@ def encerrar_processos_app(destino: Path, aguardar_inicial: float = 3.0) -> None
     if aguardar_inicial > 0:
         time.sleep(aguardar_inicial)
 
-    for tentativa in range(18):
-        rodando = False
+    def _listar_via_cim() -> list[tuple[int, str]]:
+        """Lista (pid, commandline) sem depender do wmic (removido em Windows novos)."""
         try:
             out = subprocess.check_output(
-                ["wmic", "process", "get", "ProcessId,CommandLine"],
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        "Get-CimInstance Win32_Process | "
+                        "Select-Object ProcessId, CommandLine | "
+                        "ConvertTo-Csv -NoTypeInformation"
+                    ),
+                ],
                 text=True,
                 errors="replace",
-                timeout=30,
+                timeout=45,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (subprocess.SubprocessError, FileNotFoundError):
-            break
+            return []
+        import csv
+        from io import StringIO
 
-        for linha in out.splitlines():
-            linha = linha.strip()
-            if not linha or linha.startswith("CommandLine"):
+        rows: list[tuple[int, str]] = []
+        reader = csv.DictReader(StringIO(out))
+        for row in reader:
+            try:
+                pid = int(row.get("ProcessId") or 0)
+            except ValueError:
                 continue
-            # formato: CommandLine    PID  ou  PID no final
-            if not any(c.isdigit() for c in linha):
-                continue
-            partes = linha.rsplit(None, 1)
-            if len(partes) != 2 or not partes[1].isdigit():
-                continue
-            cmd, pid_s = partes[0], partes[1]
-            if int(pid_s) == meu_pid:
+            cmd = (row.get("CommandLine") or "").strip()
+            if pid and cmd:
+                rows.append((pid, cmd))
+        return rows
+
+    for tentativa in range(18):
+        rodando = False
+        processos = _listar_via_cim()
+        if not processos:
+            # Fallback legado
+            try:
+                out = subprocess.check_output(
+                    ["wmic", "process", "get", "ProcessId,CommandLine"],
+                    text=True,
+                    errors="replace",
+                    timeout=30,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                for linha in out.splitlines():
+                    linha = linha.strip()
+                    if not linha or linha.startswith("CommandLine"):
+                        continue
+                    partes = linha.rsplit(None, 1)
+                    if len(partes) != 2 or not partes[1].isdigit():
+                        continue
+                    processos.append((int(partes[1]), partes[0]))
+            except (subprocess.SubprocessError, FileNotFoundError):
+                break
+
+        for pid, cmd in processos:
+            if pid == meu_pid:
                 continue
             if not _comando_envolve_app(cmd, pastas):
                 continue
@@ -140,11 +193,12 @@ def encerrar_processos_app(destino: Path, aguardar_inicial: float = 3.0) -> None
             if tentativa >= 2:
                 try:
                     subprocess.run(
-                        ["taskkill", "/PID", pid_s, "/F"],
+                        ["taskkill", "/PID", str(pid), "/F"],
                         capture_output=True,
                         timeout=10,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
+                    _log(f"Encerrado PID {pid}")
                 except subprocess.SubprocessError:
                     pass
         if not rodando:
@@ -157,20 +211,32 @@ def encerrar_processos_app(destino: Path, aguardar_inicial: float = 3.0) -> None
             continue
         try:
             out = subprocess.check_output(
-                ["wmic", "process", "where",
-                 f"name='{nome}'", "get", "ProcessId,ExecutablePath"],
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        f"Get-CimInstance Win32_Process -Filter \"Name='{nome}'\" | "
+                        "Select-Object ProcessId, ExecutablePath | "
+                        "ConvertTo-Csv -NoTypeInformation"
+                    ),
+                ],
                 text=True,
                 errors="replace",
                 timeout=20,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            for linha in out.splitlines()[1:]:
-                if str(exe).lower() not in linha.lower():
+            import csv
+            from io import StringIO
+
+            for row in csv.DictReader(StringIO(out)):
+                path = (row.get("ExecutablePath") or "").strip()
+                if str(exe).lower() not in path.lower():
                     continue
-                partes = linha.split()
-                if partes and partes[-1].isdigit():
+                pid_s = (row.get("ProcessId") or "").strip()
+                if pid_s.isdigit() and int(pid_s) != meu_pid:
                     subprocess.run(
-                        ["taskkill", "/PID", partes[-1], "/F"],
+                        ["taskkill", "/PID", pid_s, "/F"],
                         capture_output=True,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
@@ -182,16 +248,36 @@ def encerrar_processos_app(destino: Path, aguardar_inicial: float = 3.0) -> None
 
 def baixar_zip(url: str, destino: Path, on_progresso) -> None:
     """Baixa o ZIP com callback (bytes_lidos, total ou None)."""
-    import requests
+    try:
+        import requests
+    except ImportError:
+        requests = None  # type: ignore
 
-    with requests.get(url, stream=True, timeout=120) as resp:
-        resp.raise_for_status()
+    if requests is not None:
+        with requests.get(url, stream=True, timeout=120) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length") or 0)
+            lidos = 0
+            with open(destino, "wb") as f:
+                for bloco in resp.iter_content(65536):
+                    if not bloco:
+                        continue
+                    f.write(bloco)
+                    lidos += len(bloco)
+                    on_progresso(lidos, total if total > 0 else None)
+        return
+
+    # Fallback sem requests (Python embutido mínimo)
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=120) as resp:
         total = int(resp.headers.get("Content-Length") or 0)
         lidos = 0
         with open(destino, "wb") as f:
-            for bloco in resp.iter_content(65536):
+            while True:
+                bloco = resp.read(65536)
                 if not bloco:
-                    continue
+                    break
                 f.write(bloco)
                 lidos += len(bloco)
                 on_progresso(lidos, total if total > 0 else None)

@@ -343,7 +343,7 @@ def _atualizar_github_ui() -> None:
                 cwd=str(APP_DIR),
             )
         else:
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            # Janela visível: se falhar, o usuário vê o erro no PowerShell.
             subprocess.Popen(
                 [
                     "powershell.exe",
@@ -362,7 +362,6 @@ def _atualizar_github_ui() -> None:
                     "2",
                 ],
                 cwd=str(APP_DIR),
-                creationflags=flags,
             )
     except OSError as exc:
         logging.error("Falha ao iniciar atualização GitHub: %s", exc)
