@@ -4368,6 +4368,7 @@ ETIQUETA_STATUS_PADRAO = [
     ("ENTREGUE", "Objeto entregue"),
     ("ERRO", "Erro ao gerar"),
     ("CANCELADA", "Cancelada"),
+    ("EXCLUIDA", "Excluída da fila"),
 ]
 
 
@@ -4395,7 +4396,10 @@ def listar_etiquetas_correio(
     *,
     status: str | None = None,
     busca: str | None = None,
-    limite: int = 1000,
+    data_ini=None,
+    data_fim=None,
+    incluir_excluidas: bool = False,
+    limite: int = 2000,
 ) -> list[dict]:
     """Lê a fila XX_TB_ETIQUETA_CORREIO com cliente e destino (cidade/UF)."""
     con = conectar(db_cfg)
@@ -4421,6 +4425,8 @@ def listar_etiquetas_correio(
         if status and status != "Todos":
             where.append("E.STATUS = ?")
             params.append(status)
+        elif not incluir_excluidas:
+            where.append("E.STATUS <> 'EXCLUIDA'")
         if busca and busca.strip():
             termo = f"%{busca.strip()}%"
             where.append(
@@ -4428,6 +4434,12 @@ def listar_etiquetas_correio(
                 "OR CAST(E.NF_NUMERO AS VARCHAR(20)) LIKE ?)"
             )
             params.extend([termo, termo, termo])
+        if data_ini is not None:
+            where.append("E.DT_INCLUSAO >= ?")
+            params.append(data_ini)
+        if data_fim is not None:
+            where.append("E.DT_INCLUSAO < ?")
+            params.append(data_fim)
         if where:
             sql.append("WHERE " + " AND ".join(where))
         sql.append("ORDER BY E.ID_ETIQUETA DESC")
@@ -4956,6 +4968,36 @@ def atualizar_etiqueta_prepostagem(
     finally:
         cur.close()
         _fechar_conexao(con)
+
+
+_STATUS_REMOVIVEIS_FILA = frozenset({
+    "PENDENTE", "PROCESSANDO", "GERADA", "ERRO", "CANCELADA",
+})
+
+
+def pode_excluir_etiqueta_fila(registro: dict) -> bool:
+    """True se a nota pode sair da fila (ainda sem postagem/entrega)."""
+    st = (registro.get("status") or "").strip().upper()
+    if st in ("IMPRESSO", "POSTADO", "ENTREGUE", "EXCLUIDA"):
+        return False
+    if registro.get("dt_postagem") or registro.get("dt_entrega"):
+        return False
+    return st in _STATUS_REMOVIVEIS_FILA or not st
+
+
+def excluir_etiqueta_fila(
+    db_cfg: dict,
+    id_etiqueta: int,
+    *,
+    motivo: str = "Removida da fila pelo usuário (sem etiqueta)",
+) -> None:
+    """Marca a etiqueta como EXCLUIDA — some da fila, venda/NF intactas."""
+    atualizar_etiqueta_prepostagem(
+        db_cfg,
+        int(id_etiqueta),
+        status="EXCLUIDA",
+        mensagem_erro=(motivo or "")[:500] or None,
+    )
 
 
 def parse_especie_dimensoes(especie: str) -> dict:

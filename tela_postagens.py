@@ -23,7 +23,8 @@ import threading
 import time
 import tkinter as tk
 import unicodedata
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from calendar import monthrange
 from tkinter import messagebox, ttk
 
 import config as app_config
@@ -56,6 +57,7 @@ CORES_STATUS = {
     "ENTREGUE": "#1b5e20",
     "ERRO": "#c62828",
     "CANCELADA": "#757575",
+    "EXCLUIDA": "#9e9e9e",
 }
 
 # Intervalo da rotina automática de atualização de status (10 minutos) e o
@@ -181,17 +183,25 @@ def _fmt_data_curta(valor) -> str:
 
 
 def _is_atrasado(r: dict) -> bool:
-    """True se passou da previsão e ainda não foi entregue/cancelada."""
+    """True se passou da previsão e ainda não foi entregue/cancelada/excluída."""
     prev = r.get("dt_prevista")
     if not isinstance(prev, datetime):
         prev = _parse_dt_correios(prev)
     if not prev:
         return False
-    if (r.get("status") or "").upper() in ("ENTREGUE", "CANCELADA"):
+    if (r.get("status") or "").upper() in ("ENTREGUE", "CANCELADA", "EXCLUIDA"):
         return False
     if r.get("dt_entrega"):
         return False
     return datetime.now().date() > prev.date()
+
+
+def _periodo_mes_vigente() -> tuple[str, str]:
+    """Retorna (dd/mm/aaaa, dd/mm/aaaa) do 1º ao último dia do mês atual."""
+    hoje = date.today()
+    ini = date(hoje.year, hoje.month, 1)
+    fim = date(hoje.year, hoje.month, monthrange(hoje.year, hoje.month)[1])
+    return ini.strftime("%d/%m/%Y"), fim.strftime("%d/%m/%Y")
 
 
 _FORMATO_NOME = {"1": "Envelope", "2": "Pacote / Caixa", "3": "Rolo / Cilindro"}
@@ -469,7 +479,7 @@ class PostagensFrame(tk.Frame):
         self._entry_iid: str | None = None
         self._atrasados_alertados: set[str] = set()
         self._qtd_atrasados = 0
-        self._filtro_atraso_on = False
+        self._filtro_atraso_on = True  # padrão: só envios em atraso
         self._ultima_sync_auto: datetime | None = None
         self._sync_after_id = None
         # download de rótulo em segundo plano (quando os Correios demoram)
@@ -550,25 +560,51 @@ class PostagensFrame(tk.Frame):
         self.cb_status.bind("<<ComboboxSelected>>", lambda _e: self.recarregar())
 
         ttk.Label(barra, text="Período (inclusão):", style="Filtro.TLabel").grid(row=0, column=2, padx=(0, 6))
-        self.var_data_ini = tk.StringVar()
-        self.var_data_fim = tk.StringVar()
+        ini_mes, fim_mes = _periodo_mes_vigente()
+        self.var_data_ini = tk.StringVar(value=ini_mes)
+        self.var_data_fim = tk.StringVar(value=fim_mes)
         ttk.Entry(barra, textvariable=self.var_data_ini, width=11).grid(row=0, column=3)
         ttk.Label(barra, text="–", style="Filtro.TLabel").grid(row=0, column=4, padx=4)
         ttk.Entry(barra, textvariable=self.var_data_fim, width=11).grid(row=0, column=5, padx=(0, 16))
 
+        self.var_so_atrasadas = tk.BooleanVar(value=True)
+        self.chk_atrasadas = ttk.Checkbutton(
+            barra,
+            text="Só atrasadas",
+            variable=self.var_so_atrasadas,
+            command=self._ao_toggle_atrasadas,
+        )
+        self.chk_atrasadas.grid(row=0, column=6, padx=(0, 12))
+
         tk.Button(barra, text="Filtrar", command=self.recarregar, bg=COR_BOTAO,
                   fg=COR_BOTAO_TXT, font=("Segoe UI Semibold", 9), relief="flat",
-                  padx=16, pady=4, cursor="hand2", activebackground="#1540ad").grid(row=0, column=6)
+                  padx=16, pady=4, cursor="hand2", activebackground="#1540ad").grid(row=0, column=7)
         tk.Button(barra, text="Atualizar", command=self.recarregar, bg="#e9edf5",
                   fg="#33415c", font=("Segoe UI Semibold", 9), relief="flat",
-                  padx=12, pady=4, cursor="hand2").grid(row=0, column=7, padx=(8, 0))
+                  padx=12, pady=4, cursor="hand2").grid(row=0, column=8, padx=(8, 0))
+        tk.Button(
+            barra, text="Mês atual", command=self._aplicar_mes_vigente,
+            bg="#e9edf5", fg="#33415c", font=("Segoe UI Semibold", 9),
+            relief="flat", padx=10, pady=4, cursor="hand2",
+        ).grid(row=0, column=9, padx=(8, 0))
 
-        ttk.Label(barra, text="Buscar:", style="Filtro.TLabel").grid(row=0, column=9, padx=(16, 6), sticky=tk.E)
+        ttk.Label(barra, text="Buscar:", style="Filtro.TLabel").grid(row=0, column=11, padx=(16, 6), sticky=tk.E)
         self.var_busca = tk.StringVar()
         busca = ttk.Entry(barra, textvariable=self.var_busca, width=24)
-        busca.grid(row=0, column=10, sticky=tk.E)
+        busca.grid(row=0, column=12, sticky=tk.E)
         busca.bind("<Return>", lambda _e: self.recarregar())
-        barra.columnconfigure(8, weight=1)
+        barra.columnconfigure(10, weight=1)
+
+    def _aplicar_mes_vigente(self) -> None:
+        ini, fim = _periodo_mes_vigente()
+        self.var_data_ini.set(ini)
+        self.var_data_fim.set(fim)
+        self.recarregar()
+
+    def _ao_toggle_atrasadas(self) -> None:
+        self._filtro_atraso_on = bool(self.var_so_atrasadas.get())
+        self._aplicar_visibilidade_atraso()
+        self._atualizar_texto_alerta()
 
     # -------------------------------------------------------------- tabela
     def _montar_tabela(self) -> None:
@@ -577,7 +613,7 @@ class PostagensFrame(tk.Frame):
 
         colunas = ("sel", "numero", "cliente", "destino", "envio", "peso", "status",
                    "geracao", "postagem", "previsao", "entrega",
-                   "embalagem", "imprimir", "etiqueta", "rastreio")
+                   "embalagem", "imprimir", "etiqueta", "rastreio", "remover")
         self.tree = ttk.Treeview(
             wrap, columns=colunas, show="headings",
             style="Postagens.Treeview", selectmode="browse",
@@ -597,6 +633,7 @@ class PostagensFrame(tk.Frame):
         self.tree.heading("imprimir", text="", anchor=tk.CENTER)
         self.tree.heading("etiqueta", text="", anchor=tk.CENTER)
         self.tree.heading("rastreio", text="", anchor=tk.CENTER)
+        self.tree.heading("remover", text="", anchor=tk.CENTER)
         self.tree.column("sel", width=36, anchor=tk.CENTER, stretch=False)
         self.tree.column("numero", width=64, anchor=tk.W, stretch=False)
         self.tree.column("cliente", width=170, anchor=tk.W)
@@ -612,6 +649,7 @@ class PostagensFrame(tk.Frame):
         self.tree.column("imprimir", width=92, anchor=tk.CENTER, stretch=False)
         self.tree.column("etiqueta", width=118, anchor=tk.CENTER, stretch=False)
         self.tree.column("rastreio", width=92, anchor=tk.CENTER, stretch=False)
+        self.tree.column("remover", width=88, anchor=tk.CENTER, stretch=False)
 
         scroll = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.tree.yview)
         scroll_x = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=self.tree.xview)
@@ -665,6 +703,13 @@ class PostagensFrame(tk.Frame):
             activebackground="#a31f1f", state=tk.DISABLED,
         )
         self.btn_cancelar_lote.pack(side=tk.RIGHT, padx=(0, 8))
+        self.btn_remover_lote = tk.Button(
+            rodape, text="🗑  Remover da fila", command=self._acao_remover_selecionadas,
+            bg="#6d4c41", fg="#ffffff", font=("Segoe UI Semibold", 9),
+            relief="flat", padx=16, pady=5, cursor="hand2",
+            activebackground="#5d4037", state=tk.DISABLED,
+        )
+        self.btn_remover_lote.pack(side=tk.RIGHT, padx=(0, 8))
         tk.Button(
             rodape, text="Limpar seleção", command=self._limpar_marcacoes,
             bg="#e9edf5", fg="#33415c", font=("Segoe UI Semibold", 9),
@@ -694,12 +739,20 @@ class PostagensFrame(tk.Frame):
         self.lbl_total.configure(text="Carregando...", fg="#5a6b85")
         status = self._status_codigo_selecionado()
         busca = self.var_busca.get().strip()
+        data_ini = self._data_filtro_sql(self.var_data_ini.get(), fim=False)
+        data_fim = self._data_filtro_sql(self.var_data_fim.get(), fim=True)
+        incluir_excluidas = (status or "").upper() == "EXCLUIDA"
 
         def trabalho():
             embalagens: list[dict] = []
             try:
                 registros = firebird_db.listar_etiquetas_correio(
-                    self._cfg(), status=status, busca=busca
+                    self._cfg(),
+                    status=status,
+                    busca=busca,
+                    data_ini=data_ini,
+                    data_fim=data_fim,
+                    incluir_excluidas=incluir_excluidas,
                 )
                 erro = None
             except Exception as exc:  # noqa: BLE001
@@ -713,6 +766,16 @@ class PostagensFrame(tk.Frame):
             self.after(0, lambda: self._aplicar_registros(registros, erro, embalagens))
 
         threading.Thread(target=trabalho, daemon=True).start()
+
+    def _data_filtro_sql(self, texto: str, *, fim: bool) -> datetime | None:
+        """Converte dd/mm/aaaa do filtro para datetime (início do dia ou dia seguinte)."""
+        dt = _parse_data((texto or "").strip())
+        if not dt:
+            return None
+        base = datetime(dt.year, dt.month, dt.day)
+        if fim:
+            return base + timedelta(days=1)
+        return base
 
     def _aplicar_registros(self, registros: list[dict], erro: str | None,
                            embalagens: list[dict] | None = None) -> None:
@@ -779,20 +842,20 @@ class PostagensFrame(tk.Frame):
                     "🖨  Imprimir",
                     "🏷  Gerar Etiqueta",
                     "🚚  Rastrear" if r.get("cod_rastreio") else "",
+                    "🗑  Remover" if firebird_db.pode_excluir_etiqueta_fila(r) else "",
                 ),
                 tags=tuple(tags),
             )
         self._atualizar_botao_lote()
         self.lbl_total.configure(text=self._texto_rodape(len(registros)), fg="#5a6b85")
+        self._filtro_atraso_on = bool(self.var_so_atrasadas.get())
         self._atualizar_alerta_atraso(registros, atrasados)
+        self._aplicar_visibilidade_atraso()
 
     # ----------------------------------------------------- alerta de atraso
     def _atualizar_alerta_atraso(self, registros: list[dict], atrasados: int) -> None:
-        self._filtro_atraso_on = False
         self._qtd_atrasados = atrasados
-        self.lbl_alerta.configure(
-            text=(f"⚠ {atrasados} atrasada(s) — clique para filtrar" if atrasados else "")
-        )
+        self._atualizar_texto_alerta()
         atuais = {str(r["id_etiqueta"]) for r in registros if _is_atrasado(r)}
         novos = [r for r in registros
                  if _is_atrasado(r)
@@ -816,28 +879,52 @@ class PostagensFrame(tk.Frame):
             parent=self,
         )
 
-    def _filtrar_atrasados(self) -> None:
+    def _atualizar_texto_alerta(self) -> None:
         if not self._qtd_atrasados:
+            self.lbl_alerta.configure(text="")
+            return
+        if self._filtro_atraso_on:
+            self.lbl_alerta.configure(
+                text=f"⚠ {self._qtd_atrasados} atrasada(s) — desmarque «Só atrasadas» para ver todas"
+            )
+        else:
+            self.lbl_alerta.configure(
+                text=f"⚠ {self._qtd_atrasados} atrasada(s) — marque «Só atrasadas» para filtrar"
+            )
+
+    def _aplicar_visibilidade_atraso(self) -> None:
+        """Mostra só atrasadas ou todas, conforme o checkbox."""
+        if not getattr(self, "_registros", None):
             return
         if self._filtro_atraso_on:
             for r in self._registros:
                 iid = str(r["id_etiqueta"])
-                if self.tree.exists(iid):
+                if not self.tree.exists(iid):
+                    continue
+                if _is_atrasado(r):
                     self.tree.reattach(iid, "", "end")
-            self._filtro_atraso_on = False
-            self.lbl_alerta.configure(
-                text=f"⚠ {self._qtd_atrasados} atrasada(s) — clique para filtrar")
+                else:
+                    self.tree.detach(iid)
         else:
             for r in self._registros:
                 iid = str(r["id_etiqueta"])
-                if self.tree.exists(iid) and not _is_atrasado(r):
-                    self.tree.detach(iid)
-            self._filtro_atraso_on = True
-            self.lbl_alerta.configure(
-                text="⚠ mostrando só atrasadas — clique para ver todas")
+                if self.tree.exists(iid):
+                    self.tree.reattach(iid, "", "end")
+        self._atualizar_texto_alerta()
+
+    def _filtrar_atrasados(self) -> None:
+        """Clique no alerta: liga/desliga o checkbox «Só atrasadas»."""
+        if not self._qtd_atrasados and not self._filtro_atraso_on:
+            return
+        novo = not self._filtro_atraso_on
+        self.var_so_atrasadas.set(novo)
+        self._filtro_atraso_on = novo
+        self._aplicar_visibilidade_atraso()
 
     # --------------------------------------------------------- parâmetros
-    _BLOQUEIA_EDIT_PARAMS = frozenset({"IMPRESSO", "POSTADO", "ENTREGUE", "CANCELADA"})
+    _BLOQUEIA_EDIT_PARAMS = frozenset({
+        "IMPRESSO", "POSTADO", "ENTREGUE", "CANCELADA", "EXCLUIDA",
+    })
 
     def _pode_editar_parametros(self, reg: dict | None) -> bool:
         if not reg:
@@ -1133,6 +1220,8 @@ class PostagensFrame(tk.Frame):
             self._acao_gerar_etiqueta(registro, linha)
         elif coluna == "#15":
             self._acao_rastrear(registro)
+        elif coluna == "#16":
+            self._acao_remover_fila(registro)
 
     # ----------------------------------------------------------- seleção
     def _toggle_marcado(self, iid: str) -> None:
@@ -1171,6 +1260,11 @@ class PostagensFrame(tk.Frame):
             1 for r in self._registros
             if str(r["id_etiqueta"]) in self._marcados and (r.get("id_prepostagem") or "").strip()
         )
+        n_rem = sum(
+            1 for r in self._registros
+            if str(r["id_etiqueta"]) in self._marcados
+            and firebird_db.pode_excluir_etiqueta_fila(r)
+        )
         if n and not ocupado:
             self.btn_lote.configure(state=tk.NORMAL, text=f"🏷  Gerar selecionadas ({n})")
             self.btn_imprimir_lote.configure(
@@ -1190,6 +1284,12 @@ class PostagensFrame(tk.Frame):
         else:
             self.btn_cancelar_lote.configure(
                 state=tk.DISABLED, text="✖  Cancelar pré-postagem")
+        if n_rem and not ocupado:
+            self.btn_remover_lote.configure(
+                state=tk.NORMAL, text=f"🗑  Remover da fila ({n_rem})")
+        else:
+            self.btn_remover_lote.configure(
+                state=tk.DISABLED, text="🗑  Remover da fila")
 
     def _layout_rotulo(self) -> str:
         try:
@@ -1734,6 +1834,72 @@ class PostagensFrame(tk.Frame):
                 partes.append(f"\n{len(falhas)} com erro:")
                 partes += [f"  • NF {nf}: {str(e)[:120]}" for nf, e in falhas[:10]]
             messagebox.showinfo("Cancelar pré-postagem", "\n".join(partes), parent=self)
+        self.recarregar()
+
+    def _acao_remover_fila(self, registro: dict) -> None:
+        """Remove uma NF da fila de etiquetas (não apaga a venda)."""
+        if not firebird_db.pode_excluir_etiqueta_fila(registro):
+            messagebox.showinfo(
+                "Remover da fila",
+                "Esta nota não pode ser removida (já impressa, postada ou entregue).",
+                parent=self,
+            )
+            return
+        nf = registro.get("nf_numero") or "?"
+        cli = registro.get("cliente_nome") or ""
+        if not messagebox.askyesno(
+            "Remover da fila",
+            f"Remover a NF {nf} ({cli}) da fila de etiquetas?\n\n"
+            "A nota fiscal permanece no CLIPP. Apenas deixa de aparecer aqui "
+            "para geração de etiqueta.",
+            parent=self,
+        ):
+            return
+        try:
+            firebird_db.excluir_etiqueta_fila(self._cfg(), int(registro["id_etiqueta"]))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Remover da fila", str(exc), parent=self)
+            return
+        self.recarregar()
+
+    def _acao_remover_selecionadas(self) -> None:
+        if self._gerando_lote:
+            return
+        alvos = [
+            r for r in self._registros
+            if str(r["id_etiqueta"]) in self._marcados
+            and firebird_db.pode_excluir_etiqueta_fila(r)
+        ]
+        if not alvos:
+            messagebox.showinfo(
+                "Remover da fila",
+                "Nenhuma das selecionadas pode ser removida "
+                "(já impressas/postadas/entregues).",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "Remover da fila",
+            f"Remover {len(alvos)} nota(s) da fila de etiquetas?\n\n"
+            "As notas fiscais continuam no CLIPP — só saem desta tela.",
+            parent=self,
+        ):
+            return
+        falhas = []
+        for r in alvos:
+            try:
+                firebird_db.excluir_etiqueta_fila(self._cfg(), int(r["id_etiqueta"]))
+            except Exception as exc:  # noqa: BLE001
+                falhas.append((r.get("nf_numero"), str(exc)))
+        self._marcados.clear()
+        self._atualizar_botao_lote()
+        if falhas:
+            messagebox.showwarning(
+                "Remover da fila",
+                f"Removidas com sucesso, mas {len(falhas)} falharam:\n"
+                + "\n".join(f"• NF {nf}: {e[:120]}" for nf, e in falhas[:8]),
+                parent=self,
+            )
         self.recarregar()
 
     def _cliente_correios(self) -> correios_api.CorreiosClient:

@@ -115,6 +115,7 @@ _STATUS_SEED = [
     ("ENTREGUE", "Objeto entregue", "S", 55),
     ("ERRO", "Erro ao gerar", "N", 60),
     ("CANCELADA", "Cancelada", "N", 70),
+    ("EXCLUIDA", "Excluida da fila", "N", 80),
 ]
 
 # Colunas esperadas (para ALTER TABLE ADD caso falte numa base já existente).
