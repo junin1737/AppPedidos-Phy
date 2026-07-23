@@ -40,10 +40,12 @@ foreach ($p in $Pastas) {
     Remove-Item -Recurse -Force (Join-Path $Staging "$p\__pycache__") -ErrorAction SilentlyContinue
 }
 Copy-Item -Force (Join-Path $PSScriptRoot "atualizar_app.ps1") (Join-Path $Staging "atualizar_app.ps1")
-$ps1Git = Join-Path $Root "atualizar_github.ps1"
-if (Test-Path $ps1Git) {
-    Copy-Item -Force $ps1Git (Join-Path $Staging "atualizar_github.ps1")
-    Write-Host "  + atualizar_github.ps1"
+foreach ($extra in @("atualizar_github.ps1", "atualizar_github.py")) {
+    $srcExtra = Join-Path $Root $extra
+    if (Test-Path $srcExtra) {
+        Copy-Item -Force $srcExtra (Join-Path $Staging $extra)
+        Write-Host "  + $extra"
+    }
 }
 
 @"

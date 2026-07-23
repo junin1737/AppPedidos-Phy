@@ -1361,6 +1361,8 @@ def montar_itens_extensao(itens_raw: list[dict] | None) -> list[ItemPedido]:
     idioma, raridade, reprint, sku), eliminando o vazamento entre cartas que
     o parsing por texto sofria.
     """
+    from parser_pedido import _melhor_ref_no_texto, normalizar_referencia_site
+
     itens: list[ItemPedido] = []
     for raw in itens_raw or []:
         if not isinstance(raw, dict):
@@ -1369,6 +1371,23 @@ def montar_itens_extensao(itens_raw: list[dict] | None) -> list[ItemPedido]:
         sku = str(raw.get("sku") or "").strip().upper() or None
         numero = str(raw.get("numero") or "").strip() or None
         total = str(raw.get("total") or "").strip() or None
+        nome = str(raw.get("nome") or raw.get("descricao") or "").strip()
+        # Corrige falso positivo L26D-ML26 dentro de Código: L26D-ML26D-ENM31
+        ref_corrigida = normalizar_referencia_site(ref) if ref else None
+        if nome:
+            ref_desc = _melhor_ref_no_texto(nome)
+            if ref_desc and (
+                not ref_corrigida
+                or (
+                    "-EN" not in ref_corrigida
+                    and "-PT" not in ref_corrigida
+                    and "-FR" not in ref_corrigida
+                    and ("-EN" in ref_desc or "-PT" in ref_desc or "-FR" in ref_desc)
+                )
+            ):
+                ref_corrigida = ref_desc
+        if ref_corrigida:
+            ref = ref_corrigida
         if not ref and (numero and total):
             ref = f"{numero}/{total}"
         if not ref and not sku:
@@ -1387,15 +1406,17 @@ def montar_itens_extensao(itens_raw: list[dict] | None) -> list[ItemPedido]:
         idioma = str(raw.get("idioma") or "").strip().upper() or None
         raridade = str(raw.get("raridade") or "").strip() or None
         ref_orig = str(raw.get("referencia_original") or ref or sku or "").strip().upper()
+        ref_orig_norm = normalizar_referencia_site(ref_orig) or ref_orig
+        if ref_corrigida:
+            ref_orig_norm = ref_corrigida
         jogo = str(raw.get("jogo") or "").strip().lower() or None
         colecao = str(raw.get("colecao") or "").strip() or None
-        nome = str(raw.get("nome") or raw.get("descricao") or "").strip()
         if (numero and total) and not jogo:
             jogo = "pokemon"
         itens.append(
             ItemPedido(
                 quantidade=qtd,
-                referencia_original=ref_orig,
+                referencia_original=ref_orig_norm,
                 referencia=ref or sku,
                 preco_unitario=preco_unit,
                 preco_total=preco_total or round(preco_unit * qtd, 2),

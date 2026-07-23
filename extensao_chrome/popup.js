@@ -305,6 +305,30 @@ async function lerPaginaAtiva() {
       const refRe =
         /#?([A-Z][A-Z0-9]{2,3}-(?:[A-Z]{2}[A-Z]{0,3}\d{2,3}|P\d{2,3}|\d{2,3})(?:-[A-Z0-9]{2,12})?)/gi;
 
+      function normalizarCodigoSite(texto) {
+        let t = String(texto || "")
+          .toUpperCase()
+          .replace(/^#/, "")
+          .trim();
+        // LOBLOB-035 → LOB-035
+        t = t.replace(/^([A-Z][A-Z0-9]{2,3})\1-/, "$1-");
+        // LCKCRPLCKC-EN035 → LCKC-EN035
+        t = t.replace(/^([A-Z][A-Z0-9]{2,3})RP\1-/, "$1-");
+        // ABYR-SEABYR-ENSE2 / L26D-ML26D-ENM31 → ABYR-ENSE2 / L26D-ENM31
+        t = t.replace(
+          /^([A-Z][A-Z0-9]{2,3})-(?:SE|EE|[A-Z]{1,3})\1-((?:EN|PT|FR).+)$/,
+          "$1-$2"
+        );
+        return t;
+      }
+
+      function refValidaDeBruto(bruto) {
+        const n = normalizarCodigoSite(bruto);
+        refRe.lastIndex = 0;
+        const m = refRe.exec(n);
+        return m ? m[1].toUpperCase() : null;
+      }
+
       function idiomaSiglaDoBloco(txt) {
         const linhas = (txt || "")
           .split(/\n/)
@@ -332,10 +356,31 @@ async function lerPaginaAtiva() {
 
       function refsNoTexto(txt) {
         const out = [];
+        const vistos = new Set();
+        function add(ref) {
+          if (!ref || vistos.has(ref)) return;
+          vistos.add(ref);
+          out.push(ref);
+        }
+        // 1) Prioriza «Código: …» (evita L26D-ML26 falso dentro de L26D-ML26D-ENM31)
+        const codRe = /c[oó]digo\s*:\s*([A-Z0-9\-]+)/gi;
+        let mc;
+        while ((mc = codRe.exec(txt || "")) !== null) {
+          const ref = refValidaDeBruto(mc[1]);
+          if (ref) add(ref);
+        }
+        // 2) Demais ocorrências, já normalizando trechos longos com set duplicado
+        const brutoRe = /#?([A-Z][A-Z0-9]{2,3}-[A-Z0-9\-]{4,40})/gi;
+        let mb;
+        while ((mb = brutoRe.exec(txt || "")) !== null) {
+          const ref = refValidaDeBruto(mb[1]);
+          if (ref) add(ref);
+        }
+        if (out.length) return out;
         refRe.lastIndex = 0;
         let m;
-        while ((m = refRe.exec(txt)) !== null) {
-          out.push(m[1].toUpperCase());
+        while ((m = refRe.exec(txt || "")) !== null) {
+          add(m[1].toUpperCase());
         }
         return out;
       }
@@ -609,7 +654,9 @@ async function lerPaginaAtiva() {
         extra = extra || {};
         const refs = refsNoTexto(txt);
         if (!refs.length) return null;
-        const ref = refs[0];
+        // Prefere ref com idioma EN/PT/FR real (não falso ML/SL de set duplicado)
+        const ref =
+          refs.find((r) => /-(?:EN|PT|FR)/i.test(r)) || refs[0];
         const primeira = (txt.split(/\n/)[0] || "").trim();
         let nome = primeira
           .replace(/^\s*\d+\s*x\s+/i, "")

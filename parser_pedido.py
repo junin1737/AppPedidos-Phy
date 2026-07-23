@@ -275,9 +275,21 @@ def _colapsar_duplicata_meio_ref(texto: str) -> str:
 
 
 def _colapsar_duplicata_edicao_site(texto: str) -> str:
-    """ABYR-SEABYR-ENSE2 → ABYR-ENSE2; COTD-EECOTD-ENSE4 → COTD-ENSE4."""
+    """Remove set duplicado colado após letra(s) de edição.
+
+    Exemplos:
+      ABYR-SEABYR-ENSE2 → ABYR-ENSE2
+      COTD-EECOTD-ENSE4 → COTD-ENSE4
+      L26D-ML26D-ENM31 → L26D-ENM31
+      L26D-SL26D-ENS26 → L26D-ENS26
+    """
     t = (texto or "").upper().strip().lstrip("#")
-    m = re.match(r"^([A-Z][A-Z0-9]{2,3})-(SE|EE)\1-(EN.+)$", t)
+    # Legado SE/EE (mantido explícito)
+    m = re.match(rf"^({REF_SETOR})-(SE|EE)\1-((?:EN|PT|FR).+)$", t)
+    if m:
+        return f"{m.group(1)}-{m.group(3)}"
+    # Letra(s) de edição + set repetido: L26D-ML26D-ENM31
+    m = re.match(rf"^({REF_SETOR})-([A-Z]{{1,3}})\1-((?:EN|PT|FR).+)$", t)
     if m:
         return f"{m.group(1)}-{m.group(3)}"
     return t
@@ -286,10 +298,34 @@ def _colapsar_duplicata_edicao_site(texto: str) -> str:
 def _colapsar_duplicata_rp_site(texto: str) -> str:
     """LCKCRPLCKC-EN035 → LCKC-EN035 (código duplicado com marcador RP do site)."""
     t = (texto or "").upper().strip().lstrip("#")
-    m = re.match(r"^([A-Z][A-Z0-9]{2,3})RP\1-(.+)$", t)
+    m = re.match(rf"^({REF_SETOR})RP\1-(.+)$", t)
     if m:
         return f"{m.group(1)}-{m.group(2)}"
     return t
+
+
+def _melhor_ref_no_texto(texto: str) -> str | None:
+    """Extrai a melhor referência de um trecho (prioriza Código: e colapsa duplicata)."""
+    if not texto:
+        return None
+    t = (texto or "").upper()
+    m_cod = re.search(r"(?:C[ÓO]DIGO|CODIGO)\s*:\s*([A-Z0-9\-]+)", t, re.I)
+    if m_cod:
+        norm = normalizar_referencia_site(m_cod.group(1))
+        if norm:
+            return norm
+    # Candidatos brutos longos (com set duplicado) antes do match curto falso
+    for m in re.finditer(
+        rf"#?({REF_SETOR}-[A-Z0-9\-]{{4,40}})",
+        t,
+    ):
+        bruto = m.group(1)
+        if len(bruto) < 8:
+            continue
+        norm = normalizar_referencia_site(bruto)
+        if norm and ("-EN" in norm or "-PT" in norm or "-FR" in norm):
+            return norm
+    return normalizar_referencia_site(t)
 
 
 def _normalizar_codigo_site(texto: str) -> str:
@@ -311,15 +347,32 @@ REF_EDICAO = re.compile(
 
 def normalizar_referencia_site(texto: str) -> str | None:
     """
-    Corrige código duplicado do site: DR1DR1-EN206 → DR1-EN206.
-    Evita falso positivo «1DR1-EN206» dentro de DR1DR1-EN206.
+    Corrige código duplicado do site: DR1DR1-EN206 → DR1-EN206,
+    L26D-ML26D-ENM31 → L26D-ENM31.
+    Evita falso positivo «L26D-ML26» dentro do código duplicado.
     """
     if not texto:
         return None
-    t = _normalizar_codigo_site(texto)
-    m = REF_PADRAO.search(t)
-    if m:
-        return m.group(0).upper()
+    t = (texto or "").upper().strip()
+    m_cod = re.search(r"(?:C[ÓO]DIGO|CODIGO)\s*:\s*([A-Z0-9\-]+)", t, re.I)
+    if m_cod:
+        t = m_cod.group(1)
+    t = _normalizar_codigo_site(t)
+    # Colapsa set duplicado mesmo no meio do texto (não só no ^)
+    m_dup = re.search(
+        rf"({REF_SETOR})-([A-Z]{{1,3}})\1-((?:EN|PT|FR)[A-Z]*\d{{1,4}}{REF_SUFIXOS_OPCIONAIS})",
+        t,
+    )
+    if m_dup:
+        t = f"{m_dup.group(1)}-{m_dup.group(3)}"
+
+    matches = list(REF_PADRAO.finditer(t))
+    if matches:
+        com_idioma = [
+            m for m in matches if re.search(r"-(?:EN|PT|FR)", m.group(0), re.I)
+        ]
+        escolhidos = com_idioma or matches
+        return max(escolhidos, key=lambda m: len(m.group(0))).group(0).upper()
     m = REF_LEGADO_P.search(t)
     if m:
         return f"{m.group(1).upper()}-P{_normalizar_digitos_ref(m.group(2))}"
@@ -341,7 +394,9 @@ def normalizar_referencia_site(texto: str) -> str | None:
         r"\1-",
         ref,
     )
-    return ref if REF_PADRAO.fullmatch(ref) else REF_PADRAO.search(ref).group(0).upper()
+    return ref if REF_PADRAO.fullmatch(ref) else (
+        REF_PADRAO.search(ref).group(0).upper() if REF_PADRAO.search(ref) else None
+    )
 
 
 def _eh_linha_loja(linha: str) -> bool:

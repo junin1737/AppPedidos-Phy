@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tiao Cards → CLIPP",
-  "version": "1.6.5",
+  "version": "1.6.6",
   "description": "Importa o pedido aberto no painel para o CLIPP (Chrome em que você já está logado).",
   "permissions": ["activeTab", "scripting", "storage", "tabs"],
   "host_permissions": [

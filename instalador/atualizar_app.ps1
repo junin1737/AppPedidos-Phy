@@ -121,15 +121,21 @@ foreach ($a in $ArquivosPy) {
 }
 foreach ($p in $Pastas) {
     $src = Join-Path $Origem $p
+    $dst = Join-Path $Destino $p
     if (Test-Path $src) {
-        Copy-Item -Recurse -Force $src $Destino
+        if (Test-Path $dst) {
+            Remove-Item -Recurse -Force $dst -ErrorAction SilentlyContinue
+        }
+        Copy-Item -Recurse -Force $src $dst
         Write-Host "  - $p\ (extensao)"
     }
 }
-$ps1Git = Join-Path $Origem "atualizar_github.ps1"
-if (Test-Path $ps1Git) {
-    Copy-Item -Force $ps1Git (Join-Path $Destino "atualizar_github.ps1")
-    Write-Host "  - atualizar_github.ps1"
+foreach ($extra in @("atualizar_github.ps1", "atualizar_github.py")) {
+    $srcExtra = Join-Path $Origem $extra
+    if (Test-Path $srcExtra) {
+        Copy-Item -Force $srcExtra (Join-Path $Destino $extra)
+        Write-Host "  - $extra"
+    }
 }
 
 # Limpa cache compilado para garantir que o novo codigo rode.
@@ -148,5 +154,5 @@ if (Test-Path $launcher) {
 Write-Host ""
 Write-Host "IMPORTANTE (extensao Chrome):" -ForegroundColor Yellow
 Write-Host "  Abra chrome://extensions e clique em ATUALIZAR (Reload) na"
-Write-Host "  extensao 'Tiao Cards -> CLIPP' para pegar a versao 1.6.0."
+Write-Host "  extensao 'Tiao Cards -> CLIPP' para pegar a versao 1.6.6."
 Write-Host ""
