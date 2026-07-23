@@ -19,28 +19,31 @@ CNPJ_LOJA = "40918528000169"
 # ---------------------------------------------------------------------------
 
 # Ex.: BLZD-EN020, RA05-EN030-UR, DR1-EN206 (setor 3–4 chars, começa com letra)
+# Também: L26D-PTS26, YGLD-ENA01, LDK2-PTA01 (letra da edição entre idioma e número)
 REF_SETOR = r"[A-Z][A-Z0-9]{2,3}"
+# Idioma (EN/PT/FR) + letra(s) opcional(is) da edição (A/S/M…) + número
+REF_CORPO = r"[A-Z]{2}[A-Z]{0,3}\d{2,3}"
 REF_SUFIXOS_OPCIONAIS = r"(?:-[A-Z0-9]{2,12})*"
 REF_PADRAO = re.compile(
-    rf"{REF_SETOR}-[A-Z]{{2}}\d{{2,3}}{REF_SUFIXOS_OPCIONAIS}",
+    rf"{REF_SETOR}-{REF_CORPO}{REF_SUFIXOS_OPCIONAIS}",
     re.IGNORECASE,
 )
 REF_COM_HASH = re.compile(
-    rf"#?{REF_SETOR}-[A-Z]{{2}}\d{{2,3}}{REF_SUFIXOS_OPCIONAIS}",
+    rf"#?{REF_SETOR}-{REF_CORPO}{REF_SUFIXOS_OPCIONAIS}",
     re.IGNORECASE,
 )
 SKU_SELADO_PADRAO = re.compile(r"^YG[O]?[0-9]{4,12}$", re.IGNORECASE)
 SKU_SITE_PADRAO = re.compile(r"\b(YG[O]?[0-9]{4,12})\b", re.IGNORECASE)
 REF_OCR_EN = re.compile(
-    rf"({REF_SETOR})-EN[O0]?(\d{{2,3}})({REF_SUFIXOS_OPCIONAIS})",
+    rf"({REF_SETOR})-EN[O0]?([A-Z]*)(\d{{2,3}})({REF_SUFIXOS_OPCIONAIS})",
     re.IGNORECASE,
 )
 REF_OCR_PT = re.compile(
-    rf"({REF_SETOR})-PT[O0]?(\d{{2,3}})({REF_SUFIXOS_OPCIONAIS})",
+    rf"({REF_SETOR})-PT[O0]?([A-Z]*)(\d{{2,3}})({REF_SUFIXOS_OPCIONAIS})",
     re.IGNORECASE,
 )
 REF_OCR_FR = re.compile(
-    rf"({REF_SETOR})-FR[O0]?(\d{{2,3}})({REF_SUFIXOS_OPCIONAIS})",
+    rf"({REF_SETOR})-FR[O0]?([A-Z]*)(\d{{2,3}})({REF_SUFIXOS_OPCIONAIS})",
     re.IGNORECASE,
 )
 REF_LEGADO_NUM = re.compile(
@@ -297,7 +300,7 @@ def _normalizar_codigo_site(texto: str) -> str:
 
 
 REF_EDICAO = re.compile(
-    rf"(?:#)?({REF_SETOR})-EN[A-Z]*\d{{1,4}}{REF_SUFIXOS_OPCIONAIS}",
+    rf"(?:#)?({REF_SETOR})-(?:EN|PT|FR)[A-Z]*\d{{1,4}}{REF_SUFIXOS_OPCIONAIS}",
     re.IGNORECASE,
 )
 
@@ -327,7 +330,7 @@ def normalizar_referencia_site(texto: str) -> str | None:
     if m:
         return m.group(0).upper()
     m = re.search(
-        rf"([A-Z][A-Z0-9]{{2,3}})(?:\1)?-[A-Z]{{2}}\d{{2,3}}{REF_SUFIXOS_OPCIONAIS}",
+        rf"([A-Z][A-Z0-9]{{2,3}})(?:\1)?-{REF_CORPO}{REF_SUFIXOS_OPCIONAIS}",
         t,
     )
     if not m:
@@ -400,17 +403,32 @@ def _extrair_referencia(linha: str) -> str | None:
 
     match = REF_OCR_EN.search(texto)
     if match:
-        return (_ref_en(match.group(1), match.group(2)) + (match.group(3) or "")).upper()
+        edicao = match.group(2) or ""
+        digitos = match.group(3).replace("O", "0").replace("o", "0")
+        if not edicao:
+            digitos = _normalizar_digitos_ref(digitos)
+        return (
+            f"{match.group(1).upper()}-EN{edicao}{digitos}"
+            f"{match.group(4) or ''}"
+        ).upper()
 
     match = REF_OCR_PT.search(texto)
     if match:
-        base = f"{match.group(1).upper()}-PT{_normalizar_digitos_ref(match.group(2))}"
-        return (base + (match.group(3) or "")).upper()
+        edicao = match.group(2) or ""
+        digitos = match.group(3).replace("O", "0").replace("o", "0")
+        if not edicao:
+            digitos = _normalizar_digitos_ref(digitos)
+        base = f"{match.group(1).upper()}-PT{edicao}{digitos}"
+        return (base + (match.group(4) or "")).upper()
 
     match = REF_OCR_FR.search(texto)
     if match:
-        base = f"{match.group(1).upper()}-FR{_normalizar_digitos_ref(match.group(2))}"
-        return (base + (match.group(3) or "")).upper()
+        edicao = match.group(2) or ""
+        digitos = match.group(3).replace("O", "0").replace("o", "0")
+        if not edicao:
+            digitos = _normalizar_digitos_ref(digitos)
+        base = f"{match.group(1).upper()}-FR{edicao}{digitos}"
+        return (base + (match.group(4) or "")).upper()
 
     return None
 
@@ -893,14 +911,19 @@ def _extrair_raridade_bloco(contexto: str) -> str | None:
 
 
 def _nucleo_referencia(ref: str) -> tuple[str, str, str, str] | None:
-    """Separa SET, letras após '-', dígitos e sufixo opcional (-UR etc.)."""
+    """Separa SET, letras após '-', dígitos e sufixo opcional (-UR etc.).
+
+    Preserva a largura dos dígitos (S26 ≠ S026): coleções com letra de edição
+    (L26D, YGLD, LDK2) usam 2 dígitos no número da carta.
+    """
     m = re.match(
         rf"^({REF_SETOR})-([A-Z]*)(\d{{2,3}})({REF_SUFIXOS_OPCIONAIS})$",
         (ref or "").strip().upper(),
     )
     if not m:
         return None
-    return m.group(1), m.group(2), _normalizar_digitos_ref(m.group(3)), m.group(4) or ""
+    num = m.group(3).replace("O", "0").replace("o", "0")
+    return m.group(1), m.group(2), num, m.group(4) or ""
 
 
 def _setor_usa_formato_pt_legado(setor: str, mapa: dict[str, str] | None) -> bool:
@@ -940,6 +963,7 @@ def _converter_referencia(
         return ref_original
     setor, letras, num, tail = nucleo
     idioma_u = (idioma or "").upper()
+    idiomas_ok = ("EN", "PT", "FR")
 
     n_letras = len(letras)
     if n_letras == 0:
@@ -957,19 +981,28 @@ def _converter_referencia(
         return f"{setor}-P{num}{tail}"
 
     if n_letras == 2:
+        # Sufixo é só o idioma (EN/PT/FR), sem letra de edição.
+        if letras not in idiomas_ok:
+            # Ex.: falso positivo "SL" — não tratar como idioma.
+            return f"{setor}-{letras}{num}{tail}"
         if idioma_u == "EN" and letras == "PT":
             return f"{setor}-EN{num}{tail}"
         if idioma_u == "PT" and letras == "EN":
             return f"{setor}-PT{num}{tail}"
         if idioma_u == "FR" and letras == "EN":
             return f"{setor}-FR{num}{tail}"
-        if idioma_u == "EN":
-            return f"{setor}-EN{num}{tail}"
-        if idioma_u == "PT":
-            return f"{setor}-PT{num}{tail}"
-        if idioma_u == "FR":
-            return f"{setor}-FR{num}{tail}"
+        if idioma_u in idiomas_ok:
+            return f"{setor}-{idioma_u}{num}{tail}"
         return f"{setor}-{letras}{num}{tail}"
+
+    if n_letras >= 3:
+        # Ex.: ENS26, PTS26, ENA01, PTA01 (idioma + letra(s) da edição).
+        lang_ref = letras[:2]
+        edicao = letras[2:]
+        if lang_ref not in idiomas_ok:
+            return f"{setor}-{letras}{num}{tail}"
+        alvo = idioma_u if idioma_u in idiomas_ok else lang_ref
+        return f"{setor}-{alvo}{edicao}{num}{tail}"
 
     return ref_original
 

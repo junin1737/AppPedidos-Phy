@@ -303,7 +303,7 @@ async function lerPaginaAtiva() {
       }
 
       const refRe =
-        /#?([A-Z][A-Z0-9]{2,3}-(?:[A-Z]{2}\d{2,3}|P\d{2,3}|\d{2,3})(?:-[A-Z0-9]{2,12})?)/gi;
+        /#?([A-Z][A-Z0-9]{2,3}-(?:[A-Z]{2}[A-Z]{0,3}\d{2,3}|P\d{2,3}|\d{2,3})(?:-[A-Z0-9]{2,12})?)/gi;
 
       function idiomaSiglaDoBloco(txt) {
         const linhas = (txt || "")
