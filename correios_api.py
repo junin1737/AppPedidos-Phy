@@ -516,7 +516,7 @@ class CorreiosClient:
         if codigo_objeto:
             params["codigoObjeto"] = str(codigo_objeto).strip().upper().replace(" ", "")
         elif id_prepostagem:
-            params["idPrePostagem"] = str(id_prepostagem).strip()
+            params["id"] = str(id_prepostagem).strip()
         else:
             raise CorreiosError("Informe codigo_objeto ou id_prepostagem.")
         resp = self._request("GET", "/prepostagem/v2/prepostagens", params=params)
@@ -536,6 +536,71 @@ class CorreiosClient:
         if isinstance(itens, list):
             return itens[0] if itens else None
         return data
+
+    def listar_prepostagens(
+        self,
+        *,
+        status: str = "PREPOSTADO",
+        data_inicial: str | None = None,
+        data_final: str | None = None,
+        tipo_objeto: str = "REGISTRADO",
+        tamanho_pagina: int = 50,
+    ) -> list[dict]:
+        """Lista pré-postagens do portal CWS, percorrendo todas as páginas.
+
+        A API exige ao menos ``status``. Para estados diferentes de
+        PREPOSTADO/PREATENDIDO, também exige um intervalo de até 30 dias.
+        """
+        status = (status or "PREPOSTADO").strip().upper()
+        size = max(1, min(int(tamanho_pagina), 100))
+        pagina = 0
+        resultado: list[dict] = []
+        while True:
+            params = {
+                "status": status,
+                "tipoObjeto": (tipo_objeto or "REGISTRADO").strip().upper(),
+                "page": str(pagina),
+                "size": str(size),
+            }
+            if data_inicial:
+                params["dataInicialCriacaoPrePostagem"] = str(data_inicial)
+            if data_final:
+                params["dataFinalCriacaoPrePostagem"] = str(data_final)
+            resp = self._request(
+                "GET", "/prepostagem/v2/prepostagens", params=params
+            )
+            if resp.status_code == 404:
+                break
+            if resp.status_code != 200:
+                raise CorreiosError(
+                    f"Erro ao listar pré-postagens ({resp.status_code}): "
+                    f"{_mensagem_erro(resp)}",
+                    status=resp.status_code,
+                    corpo=resp.text,
+                )
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise CorreiosError(
+                    "Resposta da listagem de pré-postagens não é JSON válido."
+                ) from exc
+            itens = data.get("itens") if isinstance(data, dict) else None
+            if isinstance(itens, list):
+                resultado.extend(i for i in itens if isinstance(i, dict))
+            page = data.get("page") if isinstance(data, dict) else {}
+            if not isinstance(page, dict) or not page.get("next"):
+                break
+            pagina += 1
+        return resultado
+
+    def dados_contrato(self) -> dict:
+        """Retorna contrato/cartão associados ao token atual."""
+        self.obter_token()
+        tok = self._token
+        return {
+            "contrato": (tok.contrato or "") if tok else "",
+            "cartao_postagem": (tok.cartao_postagem or "") if tok else "",
+        }
 
     def aguardar_prepostado(
         self,

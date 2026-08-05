@@ -29,7 +29,12 @@ EXCLUIR_PY = frozenset({
     "teste_prepostagem.py",
 })
 PASTAS_COPIAR = ("extensao_chrome",)
-ARQUIVOS_EXTRA = ("atualizar_github.ps1", "atualizar_github.py")
+ARQUIVOS_EXTRA = (
+    "atualizar_github.ps1",
+    "atualizar_github.py",
+    "servidor-requirements.txt",
+    "requirements.txt",
+)
 
 LOG_FILE = Path(os.environ.get("TEMP", ".")) / "AppPedidosCLIPP-atualizar.log"
 
@@ -322,6 +327,26 @@ def copiar_atualizacao(origem: Path, destino: Path, on_arquivo) -> int:
     return n
 
 
+def instalar_dependencias(destino: Path) -> None:
+    """Atualiza dependências no Python que executa o aplicativo."""
+    req = destino / "servidor-requirements.txt"
+    if not req.is_file():
+        return
+    py = destino / "python" / "python.exe"
+    executavel = str(py if py.is_file() else Path(sys.executable))
+    proc = subprocess.run(
+        [executavel, "-m", "pip", "install", "--disable-pip-version-check",
+         "--no-warn-script-location", "-r", str(req)],
+        cwd=str(destino),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        detalhe = (proc.stderr or proc.stdout or "").strip()[-1200:]
+        raise RuntimeError(f"Falha ao instalar dependências:\n{detalhe}")
+
+
 def reiniciar_app(destino: Path) -> None:
     bat = destino / "AppPedidos CLIPP.bat"
     if bat.is_file():
@@ -484,7 +509,12 @@ class JanelaAtualizacao(tk.Tk):
             copiar_atualizacao(origem, self._destino, on_arquivo)
 
             self.after(0, lambda: self._set_progresso(
-                95, "Finalizando…", "Limpando arquivos temporários.",
+                92, "Instalando componentes…",
+                "Preparando geração local da etiqueta híbrida.",
+            ))
+            instalar_dependencias(self._destino)
+            self.after(0, lambda: self._set_progresso(
+                97, "Finalizando…", "Limpando arquivos temporários.",
             ))
         finally:
             shutil.rmtree(temp_base, ignore_errors=True)

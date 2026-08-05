@@ -4431,9 +4431,10 @@ def listar_etiquetas_correio(
             termo = f"%{busca.strip()}%"
             where.append(
                 "(E.CHAVE_ACESSO LIKE ? OR UPPER(C.NOME) LIKE UPPER(?) "
-                "OR CAST(E.NF_NUMERO AS VARCHAR(20)) LIKE ?)"
+                "OR CAST(E.NF_NUMERO AS VARCHAR(20)) LIKE ? "
+                "OR E.COD_RASTREIO LIKE ? OR E.ID_PREPOSTAGEM LIKE ?)"
             )
-            params.extend([termo, termo, termo])
+            params.extend([termo, termo, termo, termo, termo])
         if data_ini is not None:
             where.append("E.DT_INCLUSAO >= ?")
             params.append(data_ini)
@@ -4965,6 +4966,221 @@ def atualizar_etiqueta_prepostagem(
             params,
         )
         con.commit()
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def sincronizar_prepostagens_portal(
+    db_cfg: dict,
+    itens: list[dict],
+) -> dict:
+    """Vincula pré-postagens criadas no portal à fila local pela chave da NF-e.
+
+    Atualiza uma linha já criada pelo trigger da NF-e ou cria a linha quando a
+    NF-e existe no CLIPP mas ainda não entrou na fila. Itens sem NF-e local são
+    ignorados para não criar registros órfãos sem ID_NFVENDA/cliente.
+    """
+    from datetime import datetime
+
+    def _texto(v) -> str:
+        return str(v or "").strip()
+
+    def _numero(v):
+        try:
+            return float(str(v).replace(",", ".")) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    def _data(v):
+        if not v:
+            return None
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).replace(
+                tzinfo=None
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _status_local(item: dict) -> str:
+        desc = _texto(item.get("descStatusAtual")).lower()
+        codigo = item.get("statusAtual")
+        if codigo == 4 or "postado" in desc and "pré" not in desc and "pre" not in desc:
+            return "POSTADO"
+        if codigo == 5 or "cancel" in desc or "expir" in desc or "estorn" in desc:
+            return "CANCELADA"
+        return "GERADA"
+
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    vinculadas = inseridas = atualizadas = ignoradas = 0
+    try:
+        for item in itens:
+            if not isinstance(item, dict):
+                ignoradas += 1
+                continue
+            id_prep = _texto(item.get("id") or item.get("idPrePostagem"))
+            rastreio = _texto(item.get("codigoObjeto")).upper().replace(" ", "")
+            chave = re.sub(r"\D", "", _texto(item.get("chaveNFe")))
+            if not id_prep or not rastreio:
+                ignoradas += 1
+                continue
+
+            cur.execute(
+                """
+                SELECT FIRST 1 ID_ETIQUETA
+                FROM XX_TB_ETIQUETA_CORREIO
+                WHERE ID_PREPOSTAGEM = ?
+                   OR COD_RASTREIO = ?
+                   OR CHAVE_ACESSO = ?
+                ORDER BY ID_ETIQUETA DESC
+                """,
+                (id_prep, rastreio, chave),
+            )
+            row = cur.fetchone()
+            id_etiqueta = int(row[0]) if row else None
+
+            if id_etiqueta is None and len(chave) == 44:
+                cur.execute(
+                    """
+                    SELECT FIRST 1 N.ID_NFVENDA, V.ID_CLIENTE, V.NF_NUMERO, V.NF_SERIE
+                    FROM TB_NFE N
+                    JOIN TB_NFVENDA V ON V.ID_NFVENDA = N.ID_NFVENDA
+                    WHERE N.ID_NFE = ?
+                    ORDER BY N.ID_NFVENDA DESC
+                    """,
+                    (chave,),
+                )
+                nf = cur.fetchone()
+                if nf:
+                    cur.execute(
+                        """
+                        INSERT INTO XX_TB_ETIQUETA_CORREIO
+                            (ID_NFVENDA, ID_CLIENTE, CHAVE_ACESSO, NF_NUMERO,
+                             NF_SERIE, STATUS, ID_PREPOSTAGEM, COD_RASTREIO,
+                             COD_SERVICO, PESO, ALTURA, LARGURA, COMPRIMENTO,
+                             DT_GERACAO, DT_ATUALIZACAO)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                CURRENT_TIMESTAMP)
+                        RETURNING ID_ETIQUETA
+                        """,
+                        (
+                            int(nf[0]),
+                            int(nf[1]) if nf[1] is not None else None,
+                            chave,
+                            int(item.get("numeroNotaFiscal") or nf[2] or 0),
+                            _texto(nf[3]) or None,
+                            _status_local(item),
+                            id_prep,
+                            rastreio,
+                            _texto(item.get("codigoServico")) or None,
+                            _numero(item.get("pesoInformado")),
+                            _numero(item.get("alturaInformada")),
+                            _numero(item.get("larguraInformada")),
+                            _numero(item.get("comprimentoInformado")),
+                            _data(item.get("dataHora")),
+                        ),
+                    )
+                    id_etiqueta = int(cur.fetchone()[0])
+                    inseridas += 1
+
+            if id_etiqueta is None:
+                ignoradas += 1
+                continue
+
+            cur.execute(
+                """
+                UPDATE XX_TB_ETIQUETA_CORREIO
+                SET STATUS = ?, ID_PREPOSTAGEM = ?, COD_RASTREIO = ?,
+                    COD_SERVICO = ?, PESO = COALESCE(?, PESO),
+                    ALTURA = COALESCE(?, ALTURA),
+                    LARGURA = COALESCE(?, LARGURA),
+                    COMPRIMENTO = COALESCE(?, COMPRIMENTO),
+                    DT_GERACAO = COALESCE(DT_GERACAO, ?),
+                    MENSAGEM_ERRO = NULL,
+                    DT_ATUALIZACAO = CURRENT_TIMESTAMP
+                WHERE ID_ETIQUETA = ?
+                """,
+                (
+                    _status_local(item),
+                    id_prep,
+                    rastreio,
+                    _texto(item.get("codigoServico")) or None,
+                    _numero(item.get("pesoInformado")),
+                    _numero(item.get("alturaInformada")),
+                    _numero(item.get("larguraInformada")),
+                    _numero(item.get("comprimentoInformado")),
+                    _data(item.get("dataHora")),
+                    id_etiqueta,
+                ),
+            )
+            vinculadas += 1
+            if row:
+                atualizadas += 1
+        con.commit()
+        return {
+            "vinculadas": vinculadas,
+            "inseridas": inseridas,
+            "atualizadas": atualizadas,
+            "ignoradas": ignoradas,
+        }
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        cur.close()
+        _fechar_conexao(con)
+
+
+def obter_dados_fiscais_etiqueta(
+    db_cfg: dict,
+    id_nfvenda: int,
+) -> dict:
+    """Dados resumidos da NF-e usados no rodapé da etiqueta híbrida."""
+    con = conectar(db_cfg)
+    cur = con.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT FIRST 1 N.ID_NFE, V.NF_NUMERO, V.NF_SERIE,
+                   COALESCE(N.EMISSAO, V.DT_EMISSAO), N.PROTOCOLO,
+                   (SELECT COALESCE(SUM(I.VLR_TOTAL), 0)
+                      FROM TB_NFV_ITEM I
+                     WHERE I.ID_NFVENDA = V.ID_NFVENDA),
+                   V.INF_COMP_EDIT
+            FROM TB_NFVENDA V
+            LEFT JOIN TB_NFE N ON N.ID_NFVENDA = V.ID_NFVENDA
+            WHERE V.ID_NFVENDA = ?
+            ORDER BY N.ID_REGISTRO DESC
+            """,
+            (int(id_nfvenda),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}
+        emissao = row[3]
+        observacao = (str(row[6]) if row[6] else "").strip()
+        obs = parse_observacao_nota(observacao)
+        if not obs.get("numero_pedido"):
+            dav = _parse_dav_numero(observacao)
+            if dav:
+                cur.execute(
+                    "SELECT FIRST 1 OBS FROM TB_NFVENDA_2 WHERE NF_NUMERO = ? "
+                    "ORDER BY ID_NFVENDA DESC",
+                    (dav,),
+                )
+                g = cur.fetchone()
+                obs = parse_observacao_nota((str(g[0]) if g and g[0] else "").strip())
+        return {
+            "chave": (row[0] or "").strip(),
+            "numero": row[1],
+            "serie": (row[2] or "").strip(),
+            "emissao": emissao.strftime("%d/%m/%Y") if emissao else "",
+            "protocolo": (row[4] or "").strip(),
+            "total": float(row[5] or 0),
+            "numero_pedido": obs.get("numero_pedido", ""),
+            "pagamento": obs.get("pagamento", ""),
+        }
     finally:
         cur.close()
         _fechar_conexao(con)

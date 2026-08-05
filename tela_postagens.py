@@ -30,6 +30,7 @@ from tkinter import messagebox, ttk
 import config as app_config
 import correios_api
 import db as firebird_db
+import etiqueta_hibrida
 
 # Formato do objeto (rótulo legível -> código Correios)
 FORMATOS_OBJETO = {
@@ -482,6 +483,7 @@ class PostagensFrame(tk.Frame):
         self._filtro_atraso_on = True  # padrão: só envios em atraso
         self._ultima_sync_auto: datetime | None = None
         self._sync_after_id = None
+        self._importando_portal = False
         # download de rótulo em segundo plano (quando os Correios demoram)
         self._rotulos_pendentes: list[dict] = []
         self._rotulo_bg_after_id = None
@@ -500,6 +502,7 @@ class PostagensFrame(tk.Frame):
 
         self._carregar_status()
         self.after(100, self.recarregar)
+        self.after(900, lambda: self._acao_importar_portal(silencioso=True))
         self._agendar_sync_auto(INTERVALO_SYNC_INICIAL_MS)
 
     # --------------------------------------------------------------- infra
@@ -613,7 +616,8 @@ class PostagensFrame(tk.Frame):
 
         colunas = ("sel", "numero", "cliente", "destino", "envio", "peso", "status",
                    "geracao", "postagem", "previsao", "entrega",
-                   "embalagem", "imprimir", "etiqueta", "rastreio", "remover")
+                   "embalagem", "imprimir", "etiqueta", "hibrida",
+                   "rastreio", "remover")
         self.tree = ttk.Treeview(
             wrap, columns=colunas, show="headings",
             style="Postagens.Treeview", selectmode="browse",
@@ -632,6 +636,7 @@ class PostagensFrame(tk.Frame):
         self.tree.heading("embalagem", text="Embalagem", anchor=tk.W)
         self.tree.heading("imprimir", text="", anchor=tk.CENTER)
         self.tree.heading("etiqueta", text="", anchor=tk.CENTER)
+        self.tree.heading("hibrida", text="", anchor=tk.CENTER)
         self.tree.heading("rastreio", text="", anchor=tk.CENTER)
         self.tree.heading("remover", text="", anchor=tk.CENTER)
         self.tree.column("sel", width=36, anchor=tk.CENTER, stretch=False)
@@ -648,6 +653,7 @@ class PostagensFrame(tk.Frame):
         self.tree.column("embalagem", width=148, anchor=tk.W, stretch=False)
         self.tree.column("imprimir", width=92, anchor=tk.CENTER, stretch=False)
         self.tree.column("etiqueta", width=118, anchor=tk.CENTER, stretch=False)
+        self.tree.column("hibrida", width=142, anchor=tk.CENTER, stretch=False)
         self.tree.column("rastreio", width=92, anchor=tk.CENTER, stretch=False)
         self.tree.column("remover", width=88, anchor=tk.CENTER, stretch=False)
 
@@ -681,6 +687,11 @@ class PostagensFrame(tk.Frame):
             bg="#e9edf5", fg="#33415c", font=("Segoe UI Semibold", 9),
             relief="flat", padx=12, pady=5, cursor="hand2",
         ).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Button(
+            rodape, text="☁  Buscar do portal", command=self._acao_importar_portal,
+            bg="#e9edf5", fg="#33415c", font=("Segoe UI Semibold", 9),
+            relief="flat", padx=12, pady=5, cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         self.btn_lote = tk.Button(
             rodape, text="🏷  Gerar selecionadas", command=self._acao_gerar_selecionadas,
@@ -689,6 +700,13 @@ class PostagensFrame(tk.Frame):
             activebackground="#1540ad", state=tk.DISABLED,
         )
         self.btn_lote.pack(side=tk.RIGHT)
+        self.btn_hibrida_lote = tk.Button(
+            rodape, text="📄  Gerar híbridas", command=self._acao_gerar_hibridas_selecionadas,
+            bg="#5e35b1", fg="#ffffff", font=("Segoe UI Semibold", 9),
+            relief="flat", padx=16, pady=5, cursor="hand2",
+            activebackground="#4527a0", state=tk.DISABLED,
+        )
+        self.btn_hibrida_lote.pack(side=tk.RIGHT, padx=(0, 8))
         self.btn_imprimir_lote = tk.Button(
             rodape, text="🖨  Imprimir selecionadas", command=self._acao_imprimir_selecionadas,
             bg="#00897b", fg="#ffffff", font=("Segoe UI Semibold", 9),
@@ -803,10 +821,26 @@ class PostagensFrame(tk.Frame):
                 None,
             )
         registros = self._filtrar_data(registros)
-        self._registros = registros
         self._marcados.clear()
         self.tree.heading("sel", text="☐")
-        self.tree.delete(*self.tree.get_children())
+        # Limpa tudo (visíveis + destacados pelo filtro «Só atrasadas») e também
+        # qualquer iid que vá entrar de novo — evita TclError «Item X already exists».
+        antigos = set(self.tree.get_children(""))
+        antigos.update(str(r["id_etiqueta"]) for r in self._registros)
+        antigos.update(str(r["id_etiqueta"]) for r in registros)
+        for iid in antigos:
+            if self.tree.exists(iid):
+                self.tree.delete(iid)
+        vistos: set[str] = set()
+        unicos: list[dict] = []
+        for r in registros:
+            iid = str(r["id_etiqueta"])
+            if iid in vistos:
+                continue
+            vistos.add(iid)
+            unicos.append(r)
+        registros = unicos
+        self._registros = registros
         atrasados = 0
         for i, r in enumerate(registros):
             iid = str(r["id_etiqueta"])
@@ -841,6 +875,7 @@ class PostagensFrame(tk.Frame):
                     self._texto_emb(iid),
                     "🖨  Imprimir",
                     "🏷  Gerar Etiqueta",
+                    "📄  Gerar híbrida" if r.get("id_prepostagem") else "",
                     "🚚  Rastrear" if r.get("cod_rastreio") else "",
                     "🗑  Remover" if firebird_db.pode_excluir_etiqueta_fila(r) else "",
                 ),
@@ -1219,8 +1254,10 @@ class PostagensFrame(tk.Frame):
         elif coluna == "#14":
             self._acao_gerar_etiqueta(registro, linha)
         elif coluna == "#15":
-            self._acao_rastrear(registro)
+            self._acao_gerar_hibrida(registro)
         elif coluna == "#16":
+            self._acao_rastrear(registro)
+        elif coluna == "#17":
             self._acao_remover_fila(registro)
 
     # ----------------------------------------------------------- seleção
@@ -1278,6 +1315,12 @@ class PostagensFrame(tk.Frame):
                 state=tk.DISABLED,
                 text="🖨  Imprimir selecionadas" if not ocupado else "Aguarde...",
             )
+        if n_canc and not ocupado:
+            self.btn_hibrida_lote.configure(
+                state=tk.NORMAL, text=f"📄  Gerar híbridas ({n_canc})")
+        else:
+            self.btn_hibrida_lote.configure(
+                state=tk.DISABLED, text="📄  Gerar híbridas")
         if n_canc and not ocupado:
             self.btn_cancelar_lote.configure(
                 state=tk.NORMAL, text=f"✖  Cancelar pré-postagem ({n_canc})")
@@ -1906,6 +1949,283 @@ class PostagensFrame(tk.Frame):
         if self._correios is None:
             self._correios = correios_api.CorreiosClient()
         return self._correios
+
+    def _acao_importar_portal(self, silencioso: bool = False) -> None:
+        """Busca pré-postagens feitas diretamente no portal e vincula pela NF-e."""
+        if self._importando_portal:
+            return
+        self._importando_portal = True
+        cliente = self._cliente_correios()
+        db_cfg = self._cfg()
+        if not silencioso:
+            self.lbl_total.configure(
+                text="Buscando pré-postagens criadas no portal...", fg="#1565c0"
+            )
+
+        def trabalho():
+            try:
+                itens: list[dict] = []
+                vistos: set[str] = set()
+                for status in ("PREPOSTADO", "PREATENDIDO"):
+                    for item in cliente.listar_prepostagens(status=status):
+                        chave = str(item.get("id") or item.get("codigoObjeto") or "")
+                        if chave and chave not in vistos:
+                            vistos.add(chave)
+                            itens.append(item)
+                resultado = firebird_db.sincronizar_prepostagens_portal(db_cfg, itens)
+                erro = None
+            except Exception as exc:  # noqa: BLE001
+                resultado, erro = {}, str(exc)
+            self.after(
+                0,
+                lambda: self._fim_importar_portal(resultado, erro, silencioso),
+            )
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def _fim_importar_portal(
+        self,
+        resultado: dict,
+        erro: str | None,
+        silencioso: bool,
+    ) -> None:
+        self._importando_portal = False
+        if erro:
+            if silencioso:
+                self.lbl_total.configure(
+                    text=f"Portal Correios indisponível: {erro[:100]}", fg="#c62828"
+                )
+            else:
+                messagebox.showerror(
+                    "Buscar do portal",
+                    f"Não foi possível consultar as pré-postagens:\n\n{erro}",
+                    parent=self,
+                )
+            return
+        vinculadas = int(resultado.get("vinculadas") or 0)
+        ignoradas = int(resultado.get("ignoradas") or 0)
+        if not silencioso:
+            self.var_so_atrasadas.set(False)
+            msg = f"{vinculadas} pré-postagem(ns) vinculada(s) à listagem."
+            if ignoradas:
+                msg += (
+                    f"\n\n{ignoradas} não foram importadas porque a chave da "
+                    "NF-e não foi encontrada neste banco do CLIPP."
+                )
+            messagebox.showinfo("Buscar do portal", msg, parent=self)
+        self.recarregar()
+
+    def _acao_gerar_hibrida(self, registro: dict) -> None:
+        """Desenha localmente rótulo postal + chave/número da NF-e."""
+        if self._gerando_lote:
+            return
+        id_prep = (registro.get("id_prepostagem") or "").strip()
+        cod = (registro.get("cod_rastreio") or "").strip()
+        if not id_prep and not cod:
+            messagebox.showinfo(
+                "Gerar etiqueta híbrida",
+                "A etiqueta precisa estar pré-postada no portal antes de gerar a híbrida.",
+                parent=self,
+            )
+            return
+        self._gerando_lote = True
+        self._atualizar_botao_lote()
+        self.lbl_total.configure(
+            text="Consultando dados e desenhando etiqueta híbrida...", fg="#1565c0"
+        )
+        cliente = self._cliente_correios()
+        db_cfg = self._cfg()
+
+        def trabalho():
+            try:
+                if cod:
+                    item = cliente.consultar_prepostagem(codigo_objeto=cod)
+                else:
+                    item = cliente.consultar_prepostagem(id_prepostagem=id_prep)
+                if not item:
+                    raise RuntimeError("Pré-postagem não encontrada nos Correios.")
+                contrato = cliente.dados_contrato().get("contrato") or ""
+                fiscal = {}
+                if registro.get("id_nfvenda") is not None:
+                    fiscal = firebird_db.obter_dados_fiscais_etiqueta(
+                        db_cfg, registro["id_nfvenda"]
+                    )
+                rast = (item.get("codigoObjeto") or cod or id_prep).strip()
+                nf = item.get("numeroNotaFiscal") or registro.get("nf_numero") or "sem_nf"
+                nome = f"hibrida_NF{nf}_{rast}.pdf"
+                caminho = os.path.join(_pasta_etiquetas(), nome)
+                etiqueta_hibrida.gerar_pdf(
+                    item,
+                    caminho,
+                    contrato=str(contrato),
+                    fiscal=fiscal,
+                )
+                erro = None
+            except Exception as exc:  # noqa: BLE001
+                caminho, erro = None, str(exc)
+            self.after(
+                0,
+                lambda: self._fim_gerar_hibrida(registro, caminho, erro),
+            )
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def _fim_gerar_hibrida(
+        self,
+        registro: dict,
+        caminho: str | None,
+        erro: str | None,
+    ) -> None:
+        self._gerando_lote = False
+        self._atualizar_botao_lote()
+        if erro or not caminho:
+            self.lbl_total.configure(text="Falha ao gerar etiqueta híbrida.", fg="#c62828")
+            messagebox.showerror(
+                "Gerar etiqueta híbrida",
+                erro or "O PDF não foi gerado.",
+                parent=self,
+            )
+            return
+        try:
+            firebird_db.atualizar_etiqueta_prepostagem(
+                self._cfg(),
+                registro["id_etiqueta"],
+                status="IMPRESSO",
+                arquivo_etiqueta=caminho[:255],
+                mensagem_erro="",
+                marcar_impressao=True,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        _abrir_arquivo(caminho)
+        self.lbl_total.configure(
+            text=f"Etiqueta híbrida gerada: {os.path.basename(caminho)}",
+            fg="#2e7d32",
+        )
+        self.recarregar()
+
+    def _acao_gerar_hibridas_selecionadas(self) -> None:
+        """Gera um único PDF com as híbridas das linhas marcadas."""
+        if self._gerando_lote:
+            return
+        alvos = [
+            r for r in self._registros
+            if str(r["id_etiqueta"]) in self._marcados
+            and ((r.get("id_prepostagem") or "").strip()
+                 or (r.get("cod_rastreio") or "").strip())
+        ]
+        if not alvos:
+            messagebox.showinfo(
+                "Gerar etiquetas híbridas",
+                "Marque etiquetas já pré-postadas no portal para gerar as híbridas.",
+                parent=self,
+            )
+            return
+        self._gerando_lote = True
+        self._atualizar_botao_lote()
+        self.lbl_total.configure(
+            text=f"Desenhando {len(alvos)} etiqueta(s) híbrida(s)...", fg="#1565c0"
+        )
+        cliente = self._cliente_correios()
+        db_cfg = self._cfg()
+
+        def trabalho():
+            paginas: list[dict] = []
+            ok: list[dict] = []
+            falhas: list[str] = []
+            contrato = ""
+            try:
+                contrato = str(cliente.dados_contrato().get("contrato") or "")
+            except Exception:  # noqa: BLE001
+                contrato = ""
+            for reg in alvos:
+                cod = (reg.get("cod_rastreio") or "").strip()
+                id_prep = (reg.get("id_prepostagem") or "").strip()
+                rotulo = cod or id_prep or str(reg.get("nf_numero") or "")
+                try:
+                    if cod:
+                        item = cliente.consultar_prepostagem(codigo_objeto=cod)
+                    else:
+                        item = cliente.consultar_prepostagem(id_prepostagem=id_prep)
+                    if not item:
+                        raise RuntimeError("Pré-postagem não encontrada nos Correios.")
+                    fiscal = {}
+                    if reg.get("id_nfvenda") is not None:
+                        fiscal = firebird_db.obter_dados_fiscais_etiqueta(
+                            db_cfg, reg["id_nfvenda"]
+                        )
+                    paginas.append(
+                        {"item": item, "contrato": contrato, "fiscal": fiscal}
+                    )
+                    ok.append(reg)
+                except Exception as exc:  # noqa: BLE001
+                    falhas.append(f"{rotulo}: {exc}")
+            caminho, erro = None, None
+            if paginas:
+                try:
+                    nome = (
+                        "hibridas_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                        f"{len(paginas)}.pdf"
+                    )
+                    caminho = etiqueta_hibrida.gerar_pdf_lote(
+                        paginas, os.path.join(_pasta_etiquetas(), nome)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    caminho, erro = None, str(exc)
+            self.after(
+                0,
+                lambda: self._fim_gerar_hibridas_lote(ok, caminho, erro, falhas),
+            )
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def _fim_gerar_hibridas_lote(
+        self,
+        registros: list[dict],
+        caminho: str | None,
+        erro: str | None,
+        falhas: list[str],
+    ) -> None:
+        self._gerando_lote = False
+        self._atualizar_botao_lote()
+        if not caminho:
+            self.lbl_total.configure(text="Falha ao gerar etiquetas híbridas.", fg="#c62828")
+            messagebox.showerror(
+                "Gerar etiquetas híbridas",
+                erro or "\n".join(falhas) or "Nenhum PDF foi gerado.",
+                parent=self,
+            )
+            return
+        for reg in registros:
+            try:
+                firebird_db.atualizar_etiqueta_prepostagem(
+                    self._cfg(),
+                    reg["id_etiqueta"],
+                    status="IMPRESSO",
+                    arquivo_etiqueta=caminho[:255],
+                    mensagem_erro="",
+                    marcar_impressao=True,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        _abrir_arquivo(caminho)
+        self.lbl_total.configure(
+            text=(
+                f"{len(registros)} etiqueta(s) híbrida(s) em "
+                f"{os.path.basename(caminho)}"
+            ),
+            fg="#2e7d32",
+        )
+        if falhas:
+            messagebox.showwarning(
+                "Gerar etiquetas híbridas",
+                "Algumas etiquetas não puderam ser geradas:\n\n"
+                + "\n".join(falhas[:10]),
+                parent=self,
+            )
+        self._limpar_marcacoes()
+        self.recarregar()
 
     def _acao_rastrear(self, registro: dict) -> None:
         cod = (registro.get("cod_rastreio") or "").strip()

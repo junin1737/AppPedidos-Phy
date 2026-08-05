@@ -221,6 +221,32 @@ def get_clipp_config(cfg: configparser.ConfigParser | None = None) -> dict:
     }
 
 
+def get_extensao_config(cfg: configparser.ConfigParser | None = None) -> dict:
+    import secrets
+
+    if cfg is None:
+        cfg = load_config()
+    if not cfg.has_section("extensao"):
+        cfg.add_section("extensao")
+    section = cfg["extensao"]
+    try:
+        porta = int(section.get("porta", "8765"))
+    except (TypeError, ValueError):
+        porta = 8765
+    token = section.get("api_token", "").strip()
+    if not token:
+        token = secrets.token_hex(16)
+        section["api_token"] = token
+        try:
+            save_config(cfg)
+        except Exception:
+            pass
+    return {
+        "porta": porta,
+        "api_token": token,
+    }
+
+
 def get_rpa_config(cfg: configparser.ConfigParser | None = None) -> dict:
     if cfg is None:
         cfg = load_config()
