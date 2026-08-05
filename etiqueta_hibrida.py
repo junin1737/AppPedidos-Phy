@@ -102,49 +102,56 @@ def _imagem_datamatrix(texto: str) -> Image.Image:
     ).copy()
 
 
-CORES_SERVICO = {
-    "MINI": (0.33, 0.75, 0.29),
-    "SEDEX": (0.98, 0.70, 0.09),
-    "PAC": (0.02, 0.46, 0.76),
+SIMBOLOS_SERVICO = {
+    "MINI": ("quadrado", (0.33, 0.75, 0.29)),
+    "SEDEX": ("domo", (0.98, 0.70, 0.09)),
+    "PAC": ("circulo", (0.02, 0.46, 0.76)),
 }
 
 
-def _cor_servico(servico: str) -> tuple[float, float, float]:
-    """Cor do símbolo por serviço: Mini Envios verde, SEDEX amarelo, PAC azul."""
+def _simbolo_do_servico(servico: str) -> tuple[str, tuple[float, float, float]]:
+    """Forma e cor conforme o rótulo do portal por serviço."""
     nome = str(servico or "").upper()
-    for chave, cor in CORES_SERVICO.items():
+    for chave, simbolo in SIMBOLOS_SERVICO.items():
         if chave in nome:
-            return cor
-    return CORES_SERVICO["PAC"]
+            return simbolo
+    return SIMBOLOS_SERVICO["PAC"]
 
 
-def _simbolo_servico(c: canvas.Canvas, cx, cy, raio, cor) -> None:
-    """Desenha o símbolo dos Correios (domo com recorte + domo menor)."""
+def _simbolo_servico(c: canvas.Canvas, cx, cy, raio, forma, cor) -> None:
+    """Desenha o símbolo do serviço: domo (SEDEX), bola (PAC) ou quadrado (Mini)."""
     c.setFillColorRGB(*cor)
-    c.rect(cx - raio, cy - raio * 0.35, raio * 2, raio * 0.35, fill=1, stroke=0)
-    c.wedge(cx - raio, cy - raio, cx + raio, cy + raio, 0, 180, fill=1, stroke=0)
-    c.setFillColorRGB(1, 1, 1)
-    c.wedge(
-        cx - raio * 0.86,
-        cy - raio * 1.15,
-        cx + raio * 0.86,
-        cy - raio * 0.15,
-        0,
-        180,
-        fill=1,
-        stroke=0,
-    )
-    c.setFillColorRGB(*cor)
-    c.wedge(
-        cx - raio * 0.42,
-        cy - raio * 1.32,
-        cx + raio * 0.42,
-        cy - raio * 0.48,
-        0,
-        180,
-        fill=1,
-        stroke=0,
-    )
+    if forma == "circulo":
+        c.circle(cx, cy, raio, fill=1, stroke=0)
+    elif forma == "quadrado":
+        c.roundRect(
+            cx - raio, cy - raio, raio * 2, raio * 2, raio * 0.18, fill=1, stroke=0
+        )
+    else:
+        c.rect(cx - raio, cy - raio * 0.35, raio * 2, raio * 0.35, fill=1, stroke=0)
+        c.wedge(cx - raio, cy - raio, cx + raio, cy + raio, 0, 180, fill=1, stroke=0)
+        c.setFillColorRGB(1, 1, 1)
+        c.wedge(
+            cx - raio * 0.86,
+            cy - raio * 1.15,
+            cx + raio * 0.86,
+            cy - raio * 0.15,
+            0,
+            180,
+            fill=1,
+            stroke=0,
+        )
+        c.setFillColorRGB(*cor)
+        c.wedge(
+            cx - raio * 0.42,
+            cy - raio * 1.32,
+            cx + raio * 0.42,
+            cy - raio * 0.48,
+            0,
+            180,
+            fill=1,
+            stroke=0,
+        )
     c.setFillColorRGB(0, 0, 0)
 
 
@@ -284,7 +291,7 @@ def _desenhar_pagina(
 
     # Cabeçalho: marca, contrato, serviço e DataMatrix.
     servico = _limitar(item.get("servico"), 30)
-    cor = _cor_servico(servico)
+    forma, cor = _simbolo_do_servico(servico)
     c.setFillColorRGB(0.12, 0.22, 0.34)
     c.setFont("Helvetica-Bold", 14)
     c.drawString(esq, 142 * mm, "Correios")
@@ -308,7 +315,7 @@ def _desenhar_pagina(
         preserveAspectRatio=True,
         mask="auto",
     )
-    _simbolo_servico(c, 85 * mm, 137 * mm, 7 * mm, cor)
+    _simbolo_servico(c, 85 * mm, 137 * mm, 7 * mm, forma, cor)
 
     # Rastreio em barra larga.
     _barcode(c, rastreio, esq, 110 * mm, util, 12.5 * mm, bar_width=0.42 * mm)
