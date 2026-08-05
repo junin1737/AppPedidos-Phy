@@ -205,6 +205,19 @@ def _periodo_mes_vigente() -> tuple[str, str]:
     return ini.strftime("%d/%m/%Y"), fim.strftime("%d/%m/%Y")
 
 
+# Período inicial da tela: recuar alguns meses evita que a virada do mês esconda
+# a fila inteira, deixando só o que foi incluído nos primeiros dias.
+DIAS_PERIODO_PADRAO = 90
+
+
+def _periodo_padrao() -> tuple[str, str]:
+    """Retorna (dd/mm/aaaa, dd/mm/aaaa) dos últimos ``DIAS_PERIODO_PADRAO`` dias."""
+    hoje = date.today()
+    ini = hoje - timedelta(days=DIAS_PERIODO_PADRAO)
+    fim = date(hoje.year, hoje.month, monthrange(hoje.year, hoje.month)[1])
+    return ini.strftime("%d/%m/%Y"), fim.strftime("%d/%m/%Y")
+
+
 _FORMATO_NOME = {"1": "Envelope", "2": "Pacote / Caixa", "3": "Rolo / Cilindro"}
 _FORMATO_COD = {v: k for k, v in _FORMATO_NOME.items()}
 
@@ -563,9 +576,9 @@ class PostagensFrame(tk.Frame):
         self.cb_status.bind("<<ComboboxSelected>>", lambda _e: self.recarregar())
 
         ttk.Label(barra, text="Período (inclusão):", style="Filtro.TLabel").grid(row=0, column=2, padx=(0, 6))
-        ini_mes, fim_mes = _periodo_mes_vigente()
-        self.var_data_ini = tk.StringVar(value=ini_mes)
-        self.var_data_fim = tk.StringVar(value=fim_mes)
+        ini_periodo, fim_periodo = _periodo_padrao()
+        self.var_data_ini = tk.StringVar(value=ini_periodo)
+        self.var_data_fim = tk.StringVar(value=fim_periodo)
         ttk.Entry(barra, textvariable=self.var_data_ini, width=11).grid(row=0, column=3)
         ttk.Label(barra, text="–", style="Filtro.TLabel").grid(row=0, column=4, padx=4)
         ttk.Entry(barra, textvariable=self.var_data_fim, width=11).grid(row=0, column=5, padx=(0, 16))
@@ -615,7 +628,7 @@ class PostagensFrame(tk.Frame):
         wrap.pack(fill=tk.BOTH, expand=True)
 
         colunas = ("sel", "numero", "cliente", "destino", "envio", "peso", "status",
-                   "geracao", "postagem", "previsao", "entrega",
+                   "tipo", "geracao", "postagem", "previsao", "entrega",
                    "embalagem", "imprimir", "etiqueta", "hibrida",
                    "rastreio", "remover")
         self.tree = ttk.Treeview(
@@ -629,6 +642,7 @@ class PostagensFrame(tk.Frame):
         self.tree.heading("envio", text="Envio", anchor=tk.W)
         self.tree.heading("peso", text="Peso (g)", anchor=tk.CENTER)
         self.tree.heading("status", text="Status", anchor=tk.W)
+        self.tree.heading("tipo", text="Tipo", anchor=tk.W)
         self.tree.heading("geracao", text="Geração", anchor=tk.CENTER)
         self.tree.heading("postagem", text="Postagem", anchor=tk.CENTER)
         self.tree.heading("previsao", text="Previsão", anchor=tk.CENTER)
@@ -646,6 +660,7 @@ class PostagensFrame(tk.Frame):
         self.tree.column("envio", width=96, anchor=tk.W, stretch=False)
         self.tree.column("peso", width=72, anchor=tk.CENTER, stretch=False)
         self.tree.column("status", width=100, anchor=tk.W, stretch=False)
+        self.tree.column("tipo", width=96, anchor=tk.W, stretch=False)
         self.tree.column("geracao", width=78, anchor=tk.CENTER, stretch=False)
         self.tree.column("postagem", width=78, anchor=tk.CENTER, stretch=False)
         self.tree.column("previsao", width=78, anchor=tk.CENTER, stretch=False)
@@ -868,6 +883,7 @@ class PostagensFrame(tk.Frame):
                     self._texto_envio(r),
                     self._texto_peso(r),
                     r["status_desc"],
+                    self._texto_tipo(r),
                     _fmt_data_curta(r.get("dt_geracao")),
                     _fmt_data_curta(r.get("dt_postagem")),
                     _fmt_data_curta(r.get("dt_prevista")),
@@ -985,6 +1001,17 @@ class PostagensFrame(tk.Frame):
     def _texto_envio(self, r: dict) -> str:
         rot = self._rotulo_envio(r)
         return rot if rot else "▾ escolher"
+
+    def _texto_tipo(self, r: dict) -> str:
+        """Distingue a etiqueta híbrida desenhada aqui do rótulo oficial em PDF."""
+        arquivo = (r.get("arquivo_etiqueta") or "").lower()
+        if "hibrida" in arquivo:
+            return "Híbrida"
+        if arquivo:
+            return "Rótulo PDF"
+        if (r.get("id_prepostagem") or "").strip():
+            return "Sem impressão"
+        return "Na fila"
 
     def _texto_peso(self, r: dict) -> str:
         p = r.get("peso")
@@ -1243,21 +1270,21 @@ class PostagensFrame(tk.Frame):
         if coluna == "#6":
             self._abrir_entry_peso(linha)
             return
-        if coluna == "#12":
+        if coluna == "#13":
             self._abrir_combo_emb(linha)
             return
         registro = next((r for r in self._registros if str(r["id_etiqueta"]) == linha), None)
         if not registro:
             return
-        if coluna == "#13":
+        if coluna == "#14":
             self._acao_imprimir(registro)
-        elif coluna == "#14":
-            self._acao_gerar_etiqueta(registro, linha)
         elif coluna == "#15":
-            self._acao_gerar_hibrida(registro)
+            self._acao_gerar_etiqueta(registro, linha)
         elif coluna == "#16":
-            self._acao_rastrear(registro)
+            self._acao_gerar_hibrida(registro)
         elif coluna == "#17":
+            self._acao_rastrear(registro)
+        elif coluna == "#18":
             self._acao_remover_fila(registro)
 
     # ----------------------------------------------------------- seleção
@@ -1855,7 +1882,7 @@ class PostagensFrame(tk.Frame):
                 continue
             try:
                 firebird_db.atualizar_etiqueta_prepostagem(
-                    db_cfg, registro["id_etiqueta"], status="CANCELADA",
+                    db_cfg, registro["id_etiqueta"], status="EXCLUIDA",
                     mensagem_erro="Pré-postagem cancelada pelo usuário",
                 )
             except Exception:  # noqa: BLE001
@@ -1884,7 +1911,7 @@ class PostagensFrame(tk.Frame):
         if not firebird_db.pode_excluir_etiqueta_fila(registro):
             messagebox.showinfo(
                 "Remover da fila",
-                "Esta nota não pode ser removida (já impressa, postada ou entregue).",
+                "Esta nota não pode ser removida porque já foi postada ou entregue.",
                 parent=self,
             )
             return
@@ -1917,7 +1944,7 @@ class PostagensFrame(tk.Frame):
             messagebox.showinfo(
                 "Remover da fila",
                 "Nenhuma das selecionadas pode ser removida "
-                "(já impressas/postadas/entregues).",
+                "(já foram postadas ou entregues).",
                 parent=self,
             )
             return
@@ -1972,6 +1999,18 @@ class PostagensFrame(tk.Frame):
                         if chave and chave not in vistos:
                             vistos.add(chave)
                             itens.append(item)
+                # Estados concluídos exigem intervalo de até 30 dias na API.
+                # Trazer os cancelados permite removê-los automaticamente da fila.
+                hoje = date.today()
+                for item in cliente.listar_prepostagens(
+                    status="CANCELADO",
+                    data_inicial=(hoje - timedelta(days=29)).isoformat(),
+                    data_final=hoje.isoformat(),
+                ):
+                    chave = str(item.get("id") or item.get("codigoObjeto") or "")
+                    if chave and chave not in vistos:
+                        vistos.add(chave)
+                        itens.append(item)
                 resultado = firebird_db.sincronizar_prepostagens_portal(db_cfg, itens)
                 erro = None
             except Exception as exc:  # noqa: BLE001
@@ -2004,9 +2043,12 @@ class PostagensFrame(tk.Frame):
             return
         vinculadas = int(resultado.get("vinculadas") or 0)
         ignoradas = int(resultado.get("ignoradas") or 0)
+        removidas = int(resultado.get("removidas") or 0)
         if not silencioso:
             self.var_so_atrasadas.set(False)
             msg = f"{vinculadas} pré-postagem(ns) vinculada(s) à listagem."
+            if removidas:
+                msg += f"\n\n{removidas} cancelada(s) removida(s) da fila."
             if ignoradas:
                 msg += (
                     f"\n\n{ignoradas} não foram importadas porque a chave da "

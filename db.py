@@ -5005,15 +5005,17 @@ def sincronizar_prepostagens_portal(
     def _status_local(item: dict) -> str:
         desc = _texto(item.get("descStatusAtual")).lower()
         codigo = item.get("statusAtual")
-        if codigo == 4 or "postado" in desc and "pré" not in desc and "pre" not in desc:
+        if codigo == 3 or "postado" in desc and "pré" not in desc and "pre" not in desc:
             return "POSTADO"
         if codigo == 5 or "cancel" in desc or "expir" in desc or "estorn" in desc:
-            return "CANCELADA"
+            # Cancelada no portal: sai da fila local, mas o registro permanece
+            # auditável no banco com status EXCLUIDA.
+            return "EXCLUIDA"
         return "GERADA"
 
     con = conectar(db_cfg)
     cur = con.cursor()
-    vinculadas = inseridas = atualizadas = ignoradas = 0
+    vinculadas = inseridas = atualizadas = ignoradas = removidas = 0
     try:
         for item in itens:
             if not isinstance(item, dict):
@@ -5022,7 +5024,8 @@ def sincronizar_prepostagens_portal(
             id_prep = _texto(item.get("id") or item.get("idPrePostagem"))
             rastreio = _texto(item.get("codigoObjeto")).upper().replace(" ", "")
             chave = re.sub(r"\D", "", _texto(item.get("chaveNFe")))
-            if not id_prep or not rastreio:
+            status_local = _status_local(item)
+            if not id_prep and not rastreio:
                 ignoradas += 1
                 continue
 
@@ -5032,15 +5035,31 @@ def sincronizar_prepostagens_portal(
                 FROM XX_TB_ETIQUETA_CORREIO
                 WHERE ID_PREPOSTAGEM = ?
                    OR COD_RASTREIO = ?
-                   OR CHAVE_ACESSO = ?
                 ORDER BY ID_ETIQUETA DESC
                 """,
-                (id_prep, rastreio, chave),
+                (id_prep, rastreio),
             )
             row = cur.fetchone()
             id_etiqueta = int(row[0]) if row else None
 
-            if id_etiqueta is None and len(chave) == 44:
+            # A chave é fallback somente para pré-postagem ativa. Uma etiqueta
+            # cancelada antiga pode ter a mesma NF de uma substituta; nesse caso
+            # nunca deve excluir a linha nova por coincidência de CHAVE_ACESSO.
+            if id_etiqueta is None and status_local != "EXCLUIDA" and len(chave) == 44:
+                cur.execute(
+                    """
+                    SELECT FIRST 1 ID_ETIQUETA
+                    FROM XX_TB_ETIQUETA_CORREIO
+                    WHERE CHAVE_ACESSO = ?
+                      AND STATUS <> 'EXCLUIDA'
+                    ORDER BY ID_ETIQUETA DESC
+                    """,
+                    (chave,),
+                )
+                row = cur.fetchone()
+                id_etiqueta = int(row[0]) if row else None
+
+            if id_etiqueta is None and status_local != "EXCLUIDA" and len(chave) == 44:
                 cur.execute(
                     """
                     SELECT FIRST 1 N.ID_NFVENDA, V.ID_CLIENTE, V.NF_NUMERO, V.NF_SERIE
@@ -5070,7 +5089,7 @@ def sincronizar_prepostagens_portal(
                             chave,
                             int(item.get("numeroNotaFiscal") or nf[2] or 0),
                             _texto(nf[3]) or None,
-                            _status_local(item),
+                            status_local,
                             id_prep,
                             rastreio,
                             _texto(item.get("codigoServico")) or None,
@@ -5102,7 +5121,7 @@ def sincronizar_prepostagens_portal(
                 WHERE ID_ETIQUETA = ?
                 """,
                 (
-                    _status_local(item),
+                    status_local,
                     id_prep,
                     rastreio,
                     _texto(item.get("codigoServico")) or None,
@@ -5115,6 +5134,8 @@ def sincronizar_prepostagens_portal(
                 ),
             )
             vinculadas += 1
+            if status_local == "EXCLUIDA":
+                removidas += 1
             if row:
                 atualizadas += 1
         con.commit()
@@ -5123,6 +5144,7 @@ def sincronizar_prepostagens_portal(
             "inseridas": inseridas,
             "atualizadas": atualizadas,
             "ignoradas": ignoradas,
+            "removidas": removidas,
         }
     except Exception:
         con.rollback()
@@ -5194,11 +5216,11 @@ _STATUS_REMOVIVEIS_FILA = frozenset({
 def pode_excluir_etiqueta_fila(registro: dict) -> bool:
     """True se a nota pode sair da fila (ainda sem postagem/entrega)."""
     st = (registro.get("status") or "").strip().upper()
-    if st in ("IMPRESSO", "POSTADO", "ENTREGUE", "EXCLUIDA"):
+    if st in ("POSTADO", "ENTREGUE", "EXCLUIDA"):
         return False
     if registro.get("dt_postagem") or registro.get("dt_entrega"):
         return False
-    return st in _STATUS_REMOVIVEIS_FILA or not st
+    return st in _STATUS_REMOVIVEIS_FILA or st == "IMPRESSO" or not st
 
 
 def excluir_etiqueta_fila(
