@@ -327,6 +327,31 @@ def copiar_atualizacao(origem: Path, destino: Path, on_arquivo) -> int:
     return n
 
 
+def _garantir_pip(executavel: str, destino: Path) -> None:
+    """O Python embutido não traz pip; instala via ensurepip/get-pip se faltar."""
+    if subprocess.run(
+        [executavel, "-m", "pip", "--version"],
+        capture_output=True, text=True, timeout=120,
+    ).returncode == 0:
+        return
+    if subprocess.run(
+        [executavel, "-m", "ensurepip", "--default-pip"],
+        capture_output=True, text=True, timeout=300,
+    ).returncode == 0:
+        return
+    from urllib.request import urlretrieve
+
+    get_pip = destino / "get-pip.py"
+    urlretrieve("https://bootstrap.pypa.io/get-pip.py", str(get_pip))
+    try:
+        subprocess.run(
+            [executavel, str(get_pip), "--no-warn-script-location"],
+            cwd=str(destino), capture_output=True, text=True, timeout=300,
+        )
+    finally:
+        get_pip.unlink(missing_ok=True)
+
+
 def instalar_dependencias(destino: Path) -> None:
     """Atualiza dependências no Python que executa o aplicativo."""
     req = destino / "servidor-requirements.txt"
@@ -334,13 +359,14 @@ def instalar_dependencias(destino: Path) -> None:
         return
     py = destino / "python" / "python.exe"
     executavel = str(py if py.is_file() else Path(sys.executable))
+    _garantir_pip(executavel, destino)
     proc = subprocess.run(
         [executavel, "-m", "pip", "install", "--disable-pip-version-check",
          "--no-warn-script-location", "-r", str(req)],
         cwd=str(destino),
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=600,
     )
     if proc.returncode != 0:
         detalhe = (proc.stderr or proc.stdout or "").strip()[-1200:]

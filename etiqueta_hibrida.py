@@ -7,20 +7,32 @@ chave, número e protocolo da NF-e para validação piloto na agência.
 
 from __future__ import annotations
 
-import io
 import re
 from pathlib import Path
 
-import zxingcpp
-from PIL import Image
-from reportlab.graphics.barcode import code128
-from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
-
+# reportlab/zxing-cpp só são importados na hora de gerar o PDF: sem eles a aba
+# de Postagens continua funcionando, apenas a etiqueta híbrida fica indisponível.
+mm = 72.0 / 25.4
 
 LARGURA = 100 * mm
 ALTURA = 150 * mm
+
+DEPENDENCIAS = ("reportlab", "zxing-cpp", "pillow")
+
+
+def verificar_dependencias() -> None:
+    """Levanta RuntimeError com instrução de instalação se faltar biblioteca."""
+    try:
+        import zxingcpp  # noqa: F401
+        from PIL import Image  # noqa: F401
+        from reportlab.pdfgen import canvas  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "A etiqueta híbrida precisa das bibliotecas "
+            f"{', '.join(DEPENDENCIAS)} ({exc}).\n\n"
+            "Instale com:\n"
+            "    pip install -r servidor-requirements.txt"
+        ) from exc
 
 
 def _digitos(valor) -> str:
@@ -84,7 +96,10 @@ def conteudo_datamatrix(item: dict) -> str:
     return resultado
 
 
-def _imagem_datamatrix(texto: str) -> Image.Image:
+def _imagem_datamatrix(texto: str):
+    import zxingcpp
+    from PIL import Image
+
     codigo = zxingcpp.create_barcode(
         texto, zxingcpp.BarcodeFormat.DataMatrix, forceSquare=True
     )
@@ -251,7 +266,7 @@ def _rastreio_formatado(codigo: str) -> str:
 
 
 def _barcode(
-    c: canvas.Canvas,
+    c,
     valor: str,
     x,
     y,
@@ -260,6 +275,8 @@ def _barcode(
     *,
     bar_width=0.28 * mm,
 ) -> None:
+    from reportlab.graphics.barcode import code128
+
     bc = code128.Code128(str(valor), barWidth=bar_width, barHeight=altura)
     escala = min(1.0, largura_max / bc.width)
     c.saveState()
@@ -304,6 +321,8 @@ def _desenhar_pagina(
         if isinstance(a, dict)
     )
     _texto(c, esq, y_serv - 0.6 * mm, siglas, 7, True, largura=33 * mm)
+
+    from reportlab.lib.utils import ImageReader
 
     dm = _imagem_datamatrix(conteudo_datamatrix(item))
     c.drawImage(
@@ -430,6 +449,9 @@ def gerar_pdf_lote(etiquetas: list[dict], caminho: str | Path) -> str:
     """
     if not etiquetas:
         raise ValueError("Nenhuma etiqueta informada para gerar o PDF.")
+    verificar_dependencias()
+    from reportlab.pdfgen import canvas
+
     caminho = str(Path(caminho))
     c = canvas.Canvas(caminho, pagesize=(LARGURA, ALTURA), pageCompression=1)
     for etq in etiquetas:
