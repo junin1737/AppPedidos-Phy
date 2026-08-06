@@ -3010,8 +3010,9 @@ class DialogoGerarEtiqueta(tk.Toplevel):
 
 
 def _pasta_etiquetas() -> str:
-    base = os.path.dirname(os.path.abspath(__file__))
-    pasta = os.path.join(base, "etiquetas")
+    # Em Program Files o Windows bloqueia escrita; usa a pasta gravável
+    # (%LOCALAPPDATA%\\AppPedidosCLIPP) quando a instalação não for gravável.
+    pasta = str(app_config.dados_dir() / "etiquetas")
     os.makedirs(pasta, exist_ok=True)
     return pasta
 
