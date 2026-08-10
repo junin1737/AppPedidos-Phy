@@ -5041,25 +5041,13 @@ def sincronizar_prepostagens_portal(
             )
             row = cur.fetchone()
             id_etiqueta = int(row[0]) if row else None
+            veio_insert = False
 
-            # A chave é fallback somente para pré-postagem ativa. Uma etiqueta
-            # cancelada antiga pode ter a mesma NF de uma substituta; nesse caso
-            # nunca deve excluir a linha nova por coincidência de CHAVE_ACESSO.
-            if id_etiqueta is None and status_local != "EXCLUIDA" and len(chave) == 44:
-                cur.execute(
-                    """
-                    SELECT FIRST 1 ID_ETIQUETA
-                    FROM XX_TB_ETIQUETA_CORREIO
-                    WHERE CHAVE_ACESSO = ?
-                      AND STATUS <> 'EXCLUIDA'
-                    ORDER BY ID_ETIQUETA DESC
-                    """,
-                    (chave,),
-                )
-                row = cur.fetchone()
-                id_etiqueta = int(row[0]) if row else None
-
-            if id_etiqueta is None and status_local != "EXCLUIDA" and len(chave) == 44:
+            # Uma NF só pode ter uma linha (UQ_XX_ETIQUETA_NFVENDA). Se a
+            # etiqueta foi removida da fila (EXCLUIDA) e o portal gerou outra
+            # pré-postagem, reaproveitamos a mesma linha em vez de INSERT.
+            nf = None
+            if id_etiqueta is None and len(chave) == 44:
                 cur.execute(
                     """
                     SELECT FIRST 1 N.ID_NFVENDA, V.ID_CLIENTE, V.NF_NUMERO, V.NF_SERIE
@@ -5074,39 +5062,60 @@ def sincronizar_prepostagens_portal(
                 if nf:
                     cur.execute(
                         """
-                        INSERT INTO XX_TB_ETIQUETA_CORREIO
-                            (ID_NFVENDA, ID_CLIENTE, CHAVE_ACESSO, NF_NUMERO,
-                             NF_SERIE, STATUS, ID_PREPOSTAGEM, COD_RASTREIO,
-                             COD_SERVICO, PESO, ALTURA, LARGURA, COMPRIMENTO,
-                             DT_GERACAO, DT_ATUALIZACAO)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                CURRENT_TIMESTAMP)
-                        RETURNING ID_ETIQUETA
+                        SELECT FIRST 1 ID_ETIQUETA
+                        FROM XX_TB_ETIQUETA_CORREIO
+                        WHERE ID_NFVENDA = ?
+                           OR CHAVE_ACESSO = ?
+                        ORDER BY ID_ETIQUETA DESC
                         """,
-                        (
-                            int(nf[0]),
-                            int(nf[1]) if nf[1] is not None else None,
-                            chave,
-                            int(item.get("numeroNotaFiscal") or nf[2] or 0),
-                            _texto(nf[3]) or None,
-                            status_local,
-                            id_prep,
-                            rastreio,
-                            _texto(item.get("codigoServico")) or None,
-                            _numero(item.get("pesoInformado")),
-                            _numero(item.get("alturaInformada")),
-                            _numero(item.get("larguraInformada")),
-                            _numero(item.get("comprimentoInformado")),
-                            _data(item.get("dataHora")),
-                        ),
+                        (int(nf[0]), chave),
                     )
-                    id_etiqueta = int(cur.fetchone()[0])
-                    inseridas += 1
+                    row = cur.fetchone()
+                    id_etiqueta = int(row[0]) if row else None
+
+            if (
+                id_etiqueta is None
+                and status_local != "EXCLUIDA"
+                and nf is not None
+            ):
+                cur.execute(
+                    """
+                    INSERT INTO XX_TB_ETIQUETA_CORREIO
+                        (ID_NFVENDA, ID_CLIENTE, CHAVE_ACESSO, NF_NUMERO,
+                         NF_SERIE, STATUS, ID_PREPOSTAGEM, COD_RASTREIO,
+                         COD_SERVICO, PESO, ALTURA, LARGURA, COMPRIMENTO,
+                         DT_GERACAO, DT_ATUALIZACAO)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            CURRENT_TIMESTAMP)
+                    RETURNING ID_ETIQUETA
+                    """,
+                    (
+                        int(nf[0]),
+                        int(nf[1]) if nf[1] is not None else None,
+                        chave,
+                        int(item.get("numeroNotaFiscal") or nf[2] or 0),
+                        _texto(nf[3]) or None,
+                        status_local,
+                        id_prep,
+                        rastreio,
+                        _texto(item.get("codigoServico")) or None,
+                        _numero(item.get("pesoInformado")),
+                        _numero(item.get("alturaInformada")),
+                        _numero(item.get("larguraInformada")),
+                        _numero(item.get("comprimentoInformado")),
+                        _data(item.get("dataHora")),
+                    ),
+                )
+                id_etiqueta = int(cur.fetchone()[0])
+                inseridas += 1
+                veio_insert = True
 
             if id_etiqueta is None:
                 ignoradas += 1
                 continue
 
+            # Reativar linha excluída limpa o PDF antigo (endereço errado, etc.).
+            limpar_impressao = status_local != "EXCLUIDA"
             cur.execute(
                 """
                 UPDATE XX_TB_ETIQUETA_CORREIO
@@ -5115,7 +5124,13 @@ def sincronizar_prepostagens_portal(
                     ALTURA = COALESCE(?, ALTURA),
                     LARGURA = COALESCE(?, LARGURA),
                     COMPRIMENTO = COALESCE(?, COMPRIMENTO),
-                    DT_GERACAO = COALESCE(DT_GERACAO, ?),
+                    DT_GERACAO = COALESCE(?, DT_GERACAO, CURRENT_TIMESTAMP),
+                    ARQUIVO_ETIQUETA = CASE
+                        WHEN ? = 1 AND STATUS = 'EXCLUIDA' THEN NULL
+                        ELSE ARQUIVO_ETIQUETA END,
+                    DT_IMPRESSAO = CASE
+                        WHEN ? = 1 AND STATUS = 'EXCLUIDA' THEN NULL
+                        ELSE DT_IMPRESSAO END,
                     MENSAGEM_ERRO = NULL,
                     DT_ATUALIZACAO = CURRENT_TIMESTAMP
                 WHERE ID_ETIQUETA = ?
@@ -5130,13 +5145,15 @@ def sincronizar_prepostagens_portal(
                     _numero(item.get("larguraInformada")),
                     _numero(item.get("comprimentoInformado")),
                     _data(item.get("dataHora")),
+                    1 if limpar_impressao else 0,
+                    1 if limpar_impressao else 0,
                     id_etiqueta,
                 ),
             )
             vinculadas += 1
             if status_local == "EXCLUIDA":
                 removidas += 1
-            if row:
+            if not veio_insert:
                 atualizadas += 1
         con.commit()
         return {
