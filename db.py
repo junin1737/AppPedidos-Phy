@@ -5184,6 +5184,8 @@ def obter_dados_fiscais_etiqueta(
             SELECT FIRST 1 N.ID_NFE, V.NF_NUMERO, V.NF_SERIE,
                    COALESCE(N.EMISSAO, V.DT_EMISSAO), N.PROTOCOLO,
                    (SELECT COALESCE(SUM(I.VLR_TOTAL), 0)
+                             + COALESCE(SUM(I.VLR_FRETE), 0)
+                             - COALESCE(SUM(I.VLR_DESC), 0)
                       FROM TB_NFV_ITEM I
                      WHERE I.ID_NFVENDA = V.ID_NFVENDA),
                    V.INF_COMP_EDIT
@@ -5210,13 +5212,16 @@ def obter_dados_fiscais_etiqueta(
                 )
                 g = cur.fetchone()
                 obs = parse_observacao_nota((str(g[0]) if g and g[0] else "").strip())
+        total = float(row[5] or 0)
+        if total < 0:
+            total = 0.0
         return {
             "chave": (row[0] or "").strip(),
             "numero": row[1],
             "serie": (row[2] or "").strip(),
             "emissao": emissao.strftime("%d/%m/%Y") if emissao else "",
             "protocolo": (row[4] or "").strip(),
-            "total": float(row[5] or 0),
+            "total": round(total, 2),
             "numero_pedido": obs.get("numero_pedido", ""),
             "pagamento": obs.get("pagamento", ""),
         }
