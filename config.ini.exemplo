@@ -3,6 +3,7 @@ database = C:\Work\MT\Cliente\Clipp\Base\CLIPP.FDB
 user = SYSDBA
 password = masterkey
 charset = WIN1252
+; Relativo à pasta do AppPedidos (não use caminho absoluto de outro PC)
 fbclient_path = fbclient64.dll
 connection_timeout = 20
 host = localhost

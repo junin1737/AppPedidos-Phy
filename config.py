@@ -20,7 +20,7 @@ DEFAULTS = {
         "user": "SYSDBA",
         "password": "masterkey",
         "charset": "WIN1252",
-        "fbclient_path": "",
+        "fbclient_path": "fbclient64.dll",
         "connection_timeout": "20",
         "host": "localhost",
         "port": "3050",
@@ -146,6 +146,47 @@ def save_config(cfg: configparser.ConfigParser) -> None:
 # Seções do INI → dicts tipados para cada módulo do projeto
 # ---------------------------------------------------------------------------
 
+def resolver_fbclient_path(path_ini: str = "") -> str:
+    """Resolve fbclient.dll relativo à pasta do app (nunca preso ao PC de build).
+
+    Ordem:
+      1. Caminho do config.ini, se existir (relativo → pasta do app)
+      2. fbclient64.dll / fbclient.dll ao lado do executável/código
+    """
+    base = app_dir()
+    bruto = (path_ini or "").strip().strip('"')
+    candidatos: list[Path] = []
+    if bruto:
+        p = Path(bruto)
+        if not p.is_absolute():
+            p = base / p
+        candidatos.append(p)
+    candidatos.extend(
+        [
+            base / "fbclient64.dll",
+            base / "fbclient.dll",
+            base / "python" / "fbclient64.dll",
+            base / "python" / "fbclient.dll",
+        ]
+    )
+    vistos: set[str] = set()
+    for cand in candidatos:
+        chave = str(cand).lower()
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        if cand.is_file():
+            return str(cand.resolve())
+    # Mantém o pedido do INI (mesmo inexistente) para a mensagem de erro citar
+    # o caminho configurado; quem chama trata o FileNotFound.
+    if bruto:
+        p = Path(bruto)
+        if not p.is_absolute():
+            p = base / p
+        return str(p)
+    return str(base / "fbclient64.dll")
+
+
 def get_db_config(cfg: configparser.ConfigParser | None = None) -> dict:
     if cfg is None:
         cfg = load_config()
@@ -156,7 +197,9 @@ def get_db_config(cfg: configparser.ConfigParser | None = None) -> dict:
         "password": section.get("password", "masterkey"),
         "charset": section.get("charset", "WIN1252"),
         "connection_timeout": int(section.get("connection_timeout", "20")),
-        "fbclient_path": section.get("fbclient_path", "").strip(),
+        "fbclient_path": resolver_fbclient_path(
+            section.get("fbclient_path", "").strip()
+        ),
         "host": section.get("host", "localhost").strip(),
         "port": int(section.get("port", "3050")),
         "use_server": section.get("use_server", "true").strip().lower()

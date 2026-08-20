@@ -143,6 +143,14 @@ def carregar_fbclient(fbclient_path: str) -> None:
     """Carrega fbclient.dll 64-bit de uma pasta local (sem instalar Firebird no sistema)."""
     global _fbclient_carregado
     path = (fbclient_path or "").strip()
+    if not path or not os.path.isfile(path):
+        # Fallback: DLL ao lado do app (ignora caminho absoluto de outra máquina).
+        try:
+            from config import resolver_fbclient_path
+
+            path = resolver_fbclient_path(path)
+        except Exception:
+            pass
     if not path:
         return
     if _fbclient_carregado == path:
