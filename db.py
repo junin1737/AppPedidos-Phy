@@ -27,6 +27,8 @@ from parser_pedido import (
     PedidoExtraido,
     digitos_documento,
     formatar_documento,
+    limpar_trecho_parenteses_site,
+    texto_parece_email,
     linha_e_apelido_nick,
     set_usa_grupo2,
     tokens_raridade_grupo2,
@@ -1011,7 +1013,9 @@ def _sanitizar_campos_endereco_cli(cli: dict) -> None:
             cli.pop(chave, None)
             continue
         if chave == "end_lograd" and (
-            _linha_lixo_endereco(val, apelido) or linha_e_apelido_nick(val, apelido)
+            _linha_lixo_endereco(val, apelido)
+            or linha_e_apelido_nick(val, apelido)
+            or texto_parece_email(val)
         ):
             cli.pop(chave, None)
     apelido = (cli.get("apelido_site") or "").strip()
@@ -1316,7 +1320,7 @@ def _completar_cliente(cur, id_cliente: int, pedido: PedidoExtraido) -> dict | N
 
     updates = {}
     alteracoes: dict = {}
-    nome_pdf = (cli.get("nome") or "").strip()[: lim.NOME]
+    nome_pdf = limpar_trecho_parenteses_site(cli.get("nome") or "")[: lim.NOME]
     nome_atual = (row[0] or "").strip()
     if nome_pdf and _deve_atualizar_nome(nome_atual, nome_pdf):
         updates["NOME"] = nome_pdf
@@ -1403,7 +1407,7 @@ def _garantir_documento_cliente(cur, id_cliente: int, pedido: PedidoExtraido) ->
 
 def cadastrar_cliente(cur, pedido: PedidoExtraido) -> int:
     cli = pedido.cliente
-    nome = cli.get("nome", "")[: lim.NOME]
+    nome = limpar_trecho_parenteses_site(cli.get("nome", ""))[: lim.NOME]
     doc_digitos = digitos_documento(cli.get("documento", ""))
     doc_db = formatar_documento(doc_digitos) if doc_digitos else ""
     ddd, fone = _telefone_para_db(cli)
@@ -4668,7 +4672,9 @@ def obter_destinatario_etiqueta(db_cfg: dict, id_etiqueta: int) -> dict | None:
                     cpf_cnpj = pj[0].strip()
 
         tipo = (r[12] or "").strip()
-        logr = (r[13] or "").strip()
+        logr = limpar_trecho_parenteses_site((r[13] or "").strip())
+        if texto_parece_email(logr):
+            tipo, logr = "", ""
         logradouro = f"{tipo} {logr}".strip() if tipo else logr
         ddd = (r[17] or "").strip()
         fone = (r[18] or "").strip().replace(" ", "")
@@ -4685,7 +4691,7 @@ def obter_destinatario_etiqueta(db_cfg: dict, id_etiqueta: int) -> dict | None:
             "largura": r[8],
             "comprimento": r[9],
             # destinatário no formato esperado por correios_api.montar_destinatario
-            "nome": (r[10] or "").strip(),
+            "nome": limpar_trecho_parenteses_site((r[10] or "").strip()),
             "cep": (r[11] or "").strip(),
             "logradouro": logradouro,
             "numero": (r[14] or "").strip(),

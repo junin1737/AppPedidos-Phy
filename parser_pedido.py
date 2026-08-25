@@ -1121,11 +1121,25 @@ def _sufixo_raridade_ref(raridade: str) -> str | None:
     return mapa.get(norm)
 
 
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+", re.I)
+
+
+def limpar_trecho_parenteses_site(texto: str) -> str:
+    """Remove «(e-mail)» / «(apelido)» que o Tiao Cards coloca após o nome."""
+    s = re.sub(r"\s*\([^)]*\)", " ", texto or "")
+    s = _EMAIL_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def texto_parece_email(texto: str) -> bool:
+    return bool(_EMAIL_RE.search(texto or ""))
+
+
 def _limpar_nome_de_linha_cpf(linha: str) -> str:
     nome = re.split(r",?\s*CPF/CNPJ", linha, flags=re.IGNORECASE)[0]
     nome = re.sub(r"^\s*Destinat[áa]rio\s*", "", nome, flags=re.IGNORECASE)
     nome = nome.strip(" ,")
-    nome = re.sub(r"\s*\([^)]+\)\s*$", "", nome).strip()
+    nome = limpar_trecho_parenteses_site(nome)
     return nome[: lim.NOME]
 
 

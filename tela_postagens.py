@@ -2096,11 +2096,15 @@ class PostagensFrame(tk.Frame):
                 nf = item.get("numeroNotaFiscal") or registro.get("nf_numero") or "sem_nf"
                 nome = f"hibrida_NF{nf}_{rast}.pdf"
                 caminho = os.path.join(_pasta_etiquetas(), nome)
+                dest_clipp = firebird_db.obter_destinatario_etiqueta(
+                    db_cfg, registro["id_etiqueta"]
+                )
                 etiqueta_hibrida.gerar_pdf(
                     item,
                     caminho,
                     contrato=str(contrato),
                     fiscal=fiscal,
+                    dest_clipp=dest_clipp,
                 )
                 erro = None
             except Exception as exc:  # noqa: BLE001
@@ -2196,8 +2200,16 @@ class PostagensFrame(tk.Frame):
                         fiscal = firebird_db.obter_dados_fiscais_etiqueta(
                             db_cfg, reg["id_nfvenda"]
                         )
+                    dest_clipp = firebird_db.obter_destinatario_etiqueta(
+                        db_cfg, reg["id_etiqueta"]
+                    )
                     paginas.append(
-                        {"item": item, "contrato": contrato, "fiscal": fiscal}
+                        {
+                            "item": item,
+                            "contrato": contrato,
+                            "fiscal": fiscal,
+                            "dest_clipp": dest_clipp,
+                        }
                     )
                     ok.append(reg)
                 except Exception as exc:  # noqa: BLE001

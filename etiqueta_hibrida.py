@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from parser_pedido import limpar_trecho_parenteses_site, texto_parece_email
+
 # reportlab/zxing-cpp só são importados na hora de gerar o PDF: sem eles a aba
 # de Postagens continua funcionando, apenas a etiqueta híbrida fica indisponível.
 mm = 72.0 / 25.4
@@ -286,15 +288,47 @@ def _barcode(
     c.restoreState()
 
 
+def _sanitizar_destinatario_item(item: dict, dest_clipp: dict | None = None) -> None:
+    """Remove e-mail/parênteses do nome e do endereço na etiqueta."""
+    dest = item.get("destinatario")
+    if not isinstance(dest, dict):
+        dest = {}
+        item["destinatario"] = dest
+    end = dest.get("endereco")
+    if not isinstance(end, dict):
+        end = {}
+        dest["endereco"] = end
+
+    nome = limpar_trecho_parenteses_site(dest.get("nome") or "")
+    logr = limpar_trecho_parenteses_site(end.get("logradouro") or "")
+    if dest_clipp:
+        if not nome or texto_parece_email(dest.get("nome") or ""):
+            nome = limpar_trecho_parenteses_site(dest_clipp.get("nome") or "")
+        if not logr or texto_parece_email(end.get("logradouro") or ""):
+            logr = limpar_trecho_parenteses_site(dest_clipp.get("logradouro") or "")
+            if dest_clipp.get("numero"):
+                end["numero"] = dest_clipp["numero"]
+            if dest_clipp.get("complemento"):
+                end["complemento"] = dest_clipp["complemento"]
+            elif texto_parece_email(end.get("complemento") or ""):
+                end.pop("complemento", None)
+    dest["nome"] = nome
+    end["logradouro"] = logr
+    if texto_parece_email(end.get("complemento") or ""):
+        end.pop("complemento", None)
+
+
 def _desenhar_pagina(
     c: canvas.Canvas,
     item: dict,
     *,
     contrato: str = "",
     fiscal: dict | None = None,
+    dest_clipp: dict | None = None,
 ) -> None:
     """Desenha uma etiqueta 100 × 150 mm na página atual do canvas."""
     fiscal = fiscal or {}
+    _sanitizar_destinatario_item(item, dest_clipp)
     chave = _digitos(item.get("chaveNFe") or fiscal.get("chave"))
     rastreio = _limitar(item.get("codigoObjeto"), 13).upper()
     if len(chave) != 44:
@@ -434,10 +468,19 @@ def gerar_pdf(
     *,
     contrato: str = "",
     fiscal: dict | None = None,
+    dest_clipp: dict | None = None,
 ) -> str:
     """Gera o PDF de uma etiqueta e retorna o caminho."""
     return gerar_pdf_lote(
-        [{"item": item, "contrato": contrato, "fiscal": fiscal}], caminho
+        [
+            {
+                "item": item,
+                "contrato": contrato,
+                "fiscal": fiscal,
+                "dest_clipp": dest_clipp,
+            }
+        ],
+        caminho,
     )
 
 
@@ -460,6 +503,7 @@ def gerar_pdf_lote(etiquetas: list[dict], caminho: str | Path) -> str:
             etq["item"],
             contrato=etq.get("contrato") or "",
             fiscal=etq.get("fiscal"),
+            dest_clipp=etq.get("dest_clipp"),
         )
         c.showPage()
     c.save()

@@ -18,6 +18,7 @@ from typing import Any, Callable
 import requests
 
 import config as app_config
+from parser_pedido import limpar_trecho_parenteses_site, texto_parece_email
 
 logger = logging.getLogger(__name__)
 
@@ -182,16 +183,19 @@ def _split_ddd(numero: Any) -> tuple[str, str]:
 
 def montar_endereco(dados: dict) -> dict:
     """Monta o bloco `endereco` no formato dos Correios a partir de um dict simples."""
+    logr = limpar_trecho_parenteses_site(dados.get("logradouro") or "")
+    if texto_parece_email(logr):
+        logr = ""
     end = {
         "cep": _somente_digitos(dados.get("cep")),
-        "logradouro": (dados.get("logradouro") or "").strip(),
+        "logradouro": logr,
         "numero": str(dados.get("numero") or "").strip(),
-        "bairro": (dados.get("bairro") or "").strip(),
+        "bairro": limpar_trecho_parenteses_site(dados.get("bairro") or ""),
         "cidade": (dados.get("cidade") or "").strip(),
         "uf": (dados.get("uf") or "").strip().upper(),
     }
-    complemento = (dados.get("complemento") or "").strip()
-    if complemento:
+    complemento = limpar_trecho_parenteses_site(dados.get("complemento") or "")
+    if complemento and not texto_parece_email(complemento):
         end["complemento"] = complemento
     return end
 
@@ -403,7 +407,7 @@ class CorreiosClient:
         pré-postagem e muitas vezes vem cadastrado errado pelo cliente.
         """
         payload: dict[str, Any] = {
-            "nome": (dados.get("nome") or "").strip(),
+            "nome": limpar_trecho_parenteses_site(dados.get("nome") or ""),
             "endereco": montar_endereco(dados),
         }
         doc = _somente_digitos(dados.get("cpfCnpj") or dados.get("cnpj") or dados.get("cpf"))

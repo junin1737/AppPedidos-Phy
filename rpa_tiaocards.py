@@ -46,6 +46,8 @@ from parser_pedido import (
     montar_referencia_clipp,
     normalizar_referencia_site,
     _nucleo_referencia,
+    limpar_trecho_parenteses_site,
+    texto_parece_email,
 )
 
 from db import _separar_tipo_logradouro, normalizar_endereco_cliente
@@ -135,8 +137,7 @@ def limpar_todo_controle_local() -> int:
 # ---------------------------------------------------------------------------
 
 def _limpar_nome_cliente(texto: str) -> str:
-    nome = re.sub(r"\s*\([^)]+\)\s*$", "", (texto or "").strip())
-    return nome.strip()
+    return limpar_trecho_parenteses_site(texto)[: lim.NOME]
 
 
 _LINHA_NOME_IGNORAR = re.compile(
@@ -161,8 +162,10 @@ def _linha_apelido_site(lin: str) -> bool:
 
 def _parse_linha_endereco_compacto(lin: str) -> dict | None:
     """«Rua X, 714 - complemento» em uma linha."""
-    s = (lin or "").strip()
+    s = limpar_trecho_parenteses_site(lin)
     if not s or "," not in s:
+        return None
+    if texto_parece_email(s):
         return None
     m = re.match(r"^(.+?),\s*(\d+[A-Za-z]?)\s*(?:-\s*(.+))?\s*$", s)
     if not m:
@@ -202,7 +205,9 @@ def _apelido_do_bloco(linhas_cli: list[str]) -> str | None:
         s = (lin or "").strip()
         m = re.search(r"\(([^)]+)\)\s*$", s)
         if m:
-            return m.group(1).strip()
+            apel = m.group(1).strip()
+            if apel and not texto_parece_email(apel):
+                return apel[:40]
         if _linha_apelido_site(s):
             return s.strip("() ").strip()
         if linha_e_apelido_nick(s):
@@ -216,7 +221,12 @@ def _linha_lixo_endereco(lin: str, apelido: str | None = None) -> bool:
         return True
     if re.match(r"^[\(\)]+$", s):
         return True
-    if linha_e_apelido_nick(s, apelido):
+    limpo = limpar_trecho_parenteses_site(s)
+    if not limpo:
+        return True
+    if texto_parece_email(limpo):
+        return True
+    if linha_e_apelido_nick(s, apelido) or linha_e_apelido_nick(limpo, apelido):
         return True
     # Apelido partido em duas linhas no HTML: «(» e «Raiden1994)»
     if re.match(r"^[A-Za-z0-9][A-Za-z0-9_\-\.]{1,39}\)\s*$", s):
@@ -228,7 +238,7 @@ def _linha_lixo_endereco(lin: str, apelido: str | None = None) -> bool:
 
 def _parece_logradouro(s: str) -> bool:
     """Linha que claramente é um logradouro (compacto «X, 123» ou com tipo)."""
-    s = (s or "").strip()
+    s = limpar_trecho_parenteses_site(s or "")
     if not s:
         return False
     if "," in s and re.search(r"\d", s):
@@ -315,7 +325,7 @@ def _parse_bloco_endereco_cliente(linhas_cli: list[str]) -> dict:
 
     nome_lin = restantes[0]
     m_apel = re.search(r"\(([^)]+)\)\s*$", nome_lin)
-    if m_apel:
+    if m_apel and not texto_parece_email(m_apel.group(1)):
         cli["apelido_site"] = m_apel.group(1).strip()[:40]
     elif apelido_bloco:
         cli["apelido_site"] = apelido_bloco[:40]
@@ -341,7 +351,7 @@ def _parse_bloco_endereco_cliente(linhas_cli: list[str]) -> dict:
         break
 
     if idx < len(restantes):
-        lin_log = restantes[idx]
+        lin_log = limpar_trecho_parenteses_site(restantes[idx]) or restantes[idx]
         if not _linha_lixo_endereco(lin_log, apelido):
             parsed = _parse_linha_endereco_compacto(lin_log)
             if parsed:
