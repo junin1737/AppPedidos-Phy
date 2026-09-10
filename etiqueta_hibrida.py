@@ -252,16 +252,6 @@ def _referencia_pedido(item: dict, fiscal: dict) -> str:
     return f"Pedido #{numero}" + (f" · {pagamento}" if pagamento else "")
 
 
-def _valor_reais(valor) -> str:
-    try:
-        numero = float(str(valor).replace(",", "."))
-    except (TypeError, ValueError):
-        return ""
-    if numero <= 0:
-        return ""
-    return f"{numero:,.2f}".replace(",", "@").replace(".", ",").replace("@", ".")
-
-
 def _rastreio_formatado(codigo: str) -> str:
     cod = re.sub(r"\s+", "", str(codigo or "").upper())
     return f"{cod[:2]} {cod[2:5]} {cod[5:8]} {cod[8:11]} {cod[11:]}"
@@ -440,11 +430,8 @@ def _desenhar_pagina(
     if serie:
         _texto(c, 78 * mm, 42 * mm, f"Série {serie}", 7)
     emissao = fiscal.get("emissao") or ""
-    valor = _valor_reais(fiscal.get("valor") or fiscal.get("total"))
     if emissao:
         _texto(c, esq, 38 * mm, f"Emissão: {emissao}", 6.5)
-    if valor:
-        _texto(c, 40 * mm, 38 * mm, f"Valor total: R$ {valor}", 6.5)
     protocolo = fiscal.get("protocolo") or ""
     if protocolo:
         _texto(c, esq, 34.3 * mm, f"Protocolo de autorização: {protocolo}", 6.5, largura=util)

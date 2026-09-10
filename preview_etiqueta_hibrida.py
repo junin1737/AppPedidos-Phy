@@ -51,7 +51,6 @@ FISCAL = {
     "serie": "1",
     "emissao": "05/08/2026",
     "protocolo": "131260012345678",
-    "valor": "349,90",
 }
 
 def gerar(saida: str, item: dict | None = None, fiscal: dict | None = None) -> str:
