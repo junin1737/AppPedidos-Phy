@@ -19,6 +19,7 @@ const produtosEl = document.getElementById("produtos");
 // Guarda o último payload lido da página para reenviar com o cliente escolhido
 // (retirada no balcão: o pedido não traz CPF e o usuário escolhe o cliente).
 let ultimoDados = null;
+let clienteEscolhidoAtual = null;
 let idVendaAtual = null;
 let faltantesPendentes = [];
 
@@ -266,9 +267,98 @@ async function escolherCliente(idCliente) {
   }
   bloquearBotao();
   limparClientes();
+  clienteEscolhidoAtual = idCliente;
   setStatus(`Importando pedido #${ultimoDados.numero_pedido} (cliente ${idCliente})...`);
   try {
     await enviarImport(ultimoDados, idCliente);
+  } catch (e) {
+    setStatus(String(e.message || e), "erro");
+  } finally {
+    liberarBotao();
+  }
+}
+
+const CAMPOS_ENDERECO = [
+  ["logradouro", "Logradouro"],
+  ["numero", "Número"],
+  ["complemento", "Complemento"],
+  ["bairro", "Bairro"],
+  ["cidade", "Cidade"],
+  ["uf", "UF"],
+  ["cep", "CEP"],
+];
+
+function blocoEndereco(titulo, endereco, diferencas) {
+  const box = document.createElement("div");
+  box.className = "endereco-box";
+  const t = document.createElement("div");
+  t.className = "endereco-titulo";
+  t.textContent = titulo;
+  box.appendChild(t);
+  CAMPOS_ENDERECO.forEach(([chave, rotulo]) => {
+    const linha = document.createElement("div");
+    linha.className = "endereco-linha";
+    if (diferencas.includes(chave)) linha.classList.add("diferente");
+    const r = document.createElement("span");
+    r.className = "rotulo";
+    r.textContent = `${rotulo}: `;
+    linha.appendChild(r);
+    linha.appendChild(document.createTextNode((endereco && endereco[chave]) || "—"));
+    box.appendChild(linha);
+  });
+  return box;
+}
+
+function mostrarConfirmacaoEndereco(json) {
+  if (!clientesEl) return;
+  clientesEl.innerHTML = "";
+  const diferencas = Array.isArray(json.diferencas) ? json.diferencas : [];
+
+  const titulo = document.createElement("div");
+  titulo.className = "titulo";
+  titulo.textContent =
+    `«${json.cliente_nome || "Cliente"}» (ID ${json.id_cliente}) já tem cadastro ` +
+    "com outro endereço:";
+  clientesEl.appendChild(titulo);
+
+  clientesEl.appendChild(blocoEndereco("Cadastro atual", json.endereco_atual, diferencas));
+  clientesEl.appendChild(blocoEndereco("Endereço do pedido", json.endereco_pedido, diferencas));
+
+  const acoes = document.createElement("div");
+  acoes.className = "endereco-acoes";
+  const btnAtualizar = document.createElement("button");
+  btnAtualizar.type = "button";
+  btnAtualizar.textContent = "Atualizar endereço";
+  btnAtualizar.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    decidirEndereco(true);
+  });
+  const btnManter = document.createElement("button");
+  btnManter.type = "button";
+  btnManter.className = "btn-sec";
+  btnManter.textContent = "Manter cadastro";
+  btnManter.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    decidirEndereco(false);
+  });
+  acoes.appendChild(btnAtualizar);
+  acoes.appendChild(btnManter);
+  clientesEl.appendChild(acoes);
+}
+
+async function decidirEndereco(atualizar) {
+  if (!ultimoDados) {
+    setStatus("Releia a página antes de decidir o endereço.", "erro");
+    return;
+  }
+  bloquearBotao();
+  limparClientes();
+  setStatus(
+    `Importando pedido #${ultimoDados.numero_pedido} ` +
+      (atualizar ? "(atualizando endereço)..." : "(mantendo endereço do cadastro)...")
+  );
+  try {
+    await enviarImport(ultimoDados, clienteEscolhidoAtual, atualizar);
   } catch (e) {
     setStatus(String(e.message || e), "erro");
   } finally {
@@ -959,6 +1049,7 @@ async function importar() {
       );
     }
     ultimoDados = dados;
+    clienteEscolhidoAtual = null;
     await enviarImport(dados, null);
   } catch (e) {
     setStatus(String(e.message || e), "erro");
@@ -976,10 +1067,10 @@ async function abrirRelatorio(relatorio) {
   });
 }
 
-async function enviarImport(dados, clienteIdEscolhido) {
-  const corpo = clienteIdEscolhido
-    ? { ...dados, cliente_id_escolhido: clienteIdEscolhido }
-    : dados;
+async function enviarImport(dados, clienteIdEscolhido, atualizarEndereco = null) {
+  const corpo = { ...dados };
+  if (clienteIdEscolhido) corpo.cliente_id_escolhido = clienteIdEscolhido;
+  if (typeof atualizarEndereco === "boolean") corpo.atualizar_endereco = atualizarEndereco;
   setStatus(`Enviando pedido #${dados.numero_pedido}...`);
   const resp = await fetch(`${URL_SERVIDOR}/import`, {
     method: "POST",
@@ -996,6 +1087,12 @@ async function enviarImport(dados, clienteIdEscolhido) {
   if (json.escolher_cliente) {
     setStatus(json.mensagem || "Escolha o cliente do pedido.", "aviso");
     mostrarSelecaoCliente(json.candidatos, json.cliente_nome);
+    return;
+  }
+
+  if (json.confirmar_endereco) {
+    setStatus(json.mensagem || "Confirme o endereço do cliente.", "aviso");
+    mostrarConfirmacaoEndereco(json);
     return;
   }
 

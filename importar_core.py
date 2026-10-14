@@ -6,7 +6,7 @@ resposta JSON para a extensão. Usado por importar_servidor e importar_site.
 
 from __future__ import annotations
 
-VERSAO = "2026.08.25-1"
+VERSAO = "2026.10.13-1"
 
 from collections.abc import Callable
 
@@ -124,9 +124,16 @@ def importar_pedido_extraido(
     vend_cfg: dict,
     *,
     cliente_id_escolhido: int | None = None,
+    atualizar_endereco: bool | None = None,
+    perguntar_endereco: bool = False,
     on_log: Callable[[str], None] | None = None,
 ) -> dict:
-    """Grava pedido já parseado. Retorna dict com ok, mensagem, detalhes."""
+    """Grava pedido já parseado. Retorna dict com ok, mensagem, detalhes.
+
+    Cliente já cadastrado só tem o endereço trocado com atualizar_endereco=True.
+    Com perguntar_endereco e sem decisão, devolve confirmar_endereco quando o
+    endereço do pedido difere do cadastro.
+    """
     numero = str(numero).strip().lstrip("#")
 
     def log(msg: str) -> None:
@@ -223,6 +230,32 @@ def importar_pedido_extraido(
         msg = "; ".join(pedido.erros) or "Nenhum item encontrado."
         log(f"ERRO: {msg}")
         return {"ok": False, "mensagem": msg}
+
+    if atualizar_endereco is None and perguntar_endereco:
+        try:
+            divergencia = firebird_db.comparar_endereco_cliente_pedido(db_cfg, pedido)
+        except Exception as exc:
+            log(f"Falha ao comparar endereço do cliente (mantém o cadastro): {exc}")
+            divergencia = None
+        if divergencia:
+            log(
+                f"Endereço do pedido difere do cadastro do cliente "
+                f"#{divergencia['id_cliente']} — aguardando decisão do usuário."
+            )
+            return {
+                "ok": False,
+                "confirmar_endereco": True,
+                **divergencia,
+                "mensagem": (
+                    f"«{divergencia['cliente_nome']}» já tem cadastro com outro "
+                    "endereço. Escolha se atualiza para o endereço do pedido."
+                ),
+            }
+    pedido.cliente["atualizar_endereco"] = bool(atualizar_endereco)
+    if atualizar_endereco:
+        log("Endereço do cliente será atualizado com o do pedido (escolha do usuário).")
+    elif atualizar_endereco is False:
+        log("Endereço do cadastro do cliente mantido (escolha do usuário).")
 
     log(f"Cliente: {pedido.cliente.get('nome')} | Itens: {len(pedido.itens)}")
     if pedido.cliente.get("documento"):
@@ -345,6 +378,7 @@ def importar_de_html(
     reprints_por_ref: dict | None = None,
     itens_extensao: list[dict] | None = None,
     cliente_id_escolhido: int | None = None,
+    atualizar_endereco: bool | None = None,
     on_log: Callable[[str], None] | None = None,
 ) -> dict:
     numero = str(numero).strip().lstrip("#")
@@ -375,5 +409,7 @@ def importar_de_html(
         nfv_cfg,
         vend_cfg,
         cliente_id_escolhido=cliente_id_escolhido,
+        atualizar_endereco=atualizar_endereco,
+        perguntar_endereco=True,
         on_log=on_log,
     )

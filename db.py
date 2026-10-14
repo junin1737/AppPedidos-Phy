@@ -1304,6 +1304,134 @@ def _pedido_retirada_balcao(pedido: PedidoExtraido) -> bool:
     return bool(re.search(r"retirada|balc[aã]o", envio, re.I))
 
 
+def _cadastro_sem_endereco(row) -> bool:
+    """row de _completar_cliente: índices 1..5 = CEP, tipo, logradouro, número, bairro."""
+    return not any(str(v or "").strip() for v in row[1:6])
+
+
+_ABREV_LOGRADOURO = {"R": "RUA", "AV": "AVENIDA", "ROD": "RODOVIA", "TV": "TRAVESSA", "AL": "ALAMEDA"}
+
+
+def _norm_endereco(valor) -> str:
+    texto = _sem_acento(str(valor or "")).upper()
+    tokens = re.split(r"[^A-Z0-9]+", texto)
+    tokens = [_ABREV_LOGRADOURO.get(t, t) for t in tokens if t]
+    return " ".join(tokens)
+
+
+def _formatar_cep_exibicao(cep) -> str:
+    dig = _so_digitos(str(cep or ""))
+    return f"{dig[:5]}-{dig[5:]}" if len(dig) == 8 else dig
+
+
+def _nome_cidade_uf(cur, id_cidade) -> tuple[str, str]:
+    if not str(id_cidade or "").strip():
+        return "", ""
+    cur.execute(
+        "SELECT TRIM(NOME), TRIM(SIGLA_UF) FROM TB_CIDADE_SIS WHERE ID_CIDADE = ?",
+        (str(id_cidade).strip(),),
+    )
+    row = cur.fetchone()
+    return (str(row[0] or ""), str(row[1] or "")) if row else ("", "")
+
+
+def comparar_endereco_cliente_pedido(db_config: dict, pedido: PedidoExtraido) -> dict | None:
+    """
+    Somente leitura: se o cliente do pedido já tem cadastro com endereço diferente
+    do pedido, devolve os dois endereços para o usuário decidir. None quando não há
+    cliente, o cadastro está sem endereço (será completado) ou os endereços batem.
+    """
+    if _pedido_retirada_balcao(pedido):
+        return None
+    cli_pedido = dict(pedido.cliente)
+    con = conectar(db_config)
+    cur = con.cursor()
+    try:
+        id_cliente = cli_pedido.get("id_cliente")
+        if not id_cliente:
+            id_cliente = buscar_cliente(
+                cur,
+                nome=cli_pedido.get("nome", ""),
+                telefone=cli_pedido.get("telefone", ""),
+                documento=cli_pedido.get("documento", ""),
+            )
+            if id_cliente and cli_pedido.get("documento"):
+                if not _cliente_documento_confere(cur, int(id_cliente), cli_pedido["documento"]):
+                    id_cliente = None
+        if not id_cliente:
+            return None
+
+        cur.execute(
+            """
+            SELECT NOME, END_CEP, END_TIPO, END_LOGRAD, END_NUMERO, END_BAIRRO, END_COMPLE,
+                   ID_CIDADE
+            FROM TB_CLIENTE WHERE ID_CLIENTE = ?
+            """,
+            (int(id_cliente),),
+        )
+        row = cur.fetchone()
+        if not row or _cadastro_sem_endereco(row):
+            return None
+
+        end_novo = _campos_endereco_para_db(cli_pedido)
+        if not any(end_novo[c] for c in ("END_CEP", "END_LOGRAD", "END_NUMERO", "END_BAIRRO")):
+            return None
+        _resolver_localizacao_cliente(cur, cli_pedido)
+        cidade_atual, uf_atual = _nome_cidade_uf(cur, row[7])
+        cidade_nova, uf_nova = _nome_cidade_uf(cur, cli_pedido.get("id_cidade"))
+        if not cidade_nova:
+            cidade_nova = str(cli_pedido.get("cidade") or "").strip()
+            uf_nova = str(cli_pedido.get("uf") or "").strip()
+
+        def _lograd(tipo, lograd) -> str:
+            return " ".join(p for p in (str(tipo or "").strip(), str(lograd or "").strip()) if p)
+
+        atual = {
+            "cep": _formatar_cep_exibicao(row[1]),
+            "logradouro": _lograd(row[2], row[3]),
+            "numero": str(row[4] or "").strip(),
+            "complemento": str(row[6] or "").strip(),
+            "bairro": str(row[5] or "").strip(),
+            "cidade": cidade_atual,
+            "uf": uf_atual,
+        }
+        novo = {
+            "cep": _formatar_cep_exibicao(end_novo["END_CEP"]),
+            "logradouro": _lograd(end_novo["END_TIPO"], end_novo["END_LOGRAD"]),
+            "numero": str(end_novo["END_NUMERO"] or "").strip(),
+            "complemento": str(
+                cli_pedido.get("texto_complemento_site") or end_novo["END_COMPLE"] or ""
+            ).strip(),
+            "bairro": str(end_novo["END_BAIRRO"] or "").strip(),
+            "cidade": cidade_nova,
+            "uf": uf_nova,
+        }
+
+        # Complemento fica fora da comparação: o longo vai só para a observação.
+        diferencas = []
+        if _so_digitos(atual["cep"]) != _so_digitos(novo["cep"]):
+            diferencas.append("cep")
+        for campo in ("logradouro", "bairro", "cidade", "uf"):
+            if _norm_endereco(atual[campo]) != _norm_endereco(novo[campo]):
+                diferencas.append(campo)
+        if _norm_endereco(atual["numero"]).replace(" ", "") != _norm_endereco(
+            novo["numero"]
+        ).replace(" ", ""):
+            diferencas.append("numero")
+        if not diferencas:
+            return None
+
+        return {
+            "id_cliente": int(id_cliente),
+            "cliente_nome": str(row[0] or "").strip(),
+            "endereco_atual": atual,
+            "endereco_pedido": novo,
+            "diferencas": diferencas,
+        }
+    finally:
+        encerrar_conexao(con, commit=False)
+
+
 def _completar_cliente(cur, id_cliente: int, pedido: PedidoExtraido) -> dict | None:
     cli = pedido.cliente
     cur.execute(
@@ -1331,22 +1459,24 @@ def _completar_cliente(cur, id_cliente: int, pedido: PedidoExtraido) -> dict | N
     retirada = _pedido_retirada_balcao(pedido)
 
     if not retirada:
-        for campo, valor in _campos_endereco_para_db(cli).items():
-            if valor:
-                updates[campo] = valor
+        # O endereço (e a observação, que o repete) só muda com confirmação do
+        # usuário; cadastro sem endereço algum é completado direto.
+        if cli.get("atualizar_endereco") or _cadastro_sem_endereco(row):
+            for campo, valor in _campos_endereco_para_db(cli).items():
+                if valor:
+                    updates[campo] = valor
 
-        for campo, valor in _corrigir_endereco_clipp_no_banco(row[2], row[3]).items():
-            if valor:
-                updates[campo] = valor
+            for campo, valor in _corrigir_endereco_clipp_no_banco(row[2], row[3]).items():
+                if valor:
+                    updates[campo] = valor
 
-        # Atualiza a observação do cadastro com os dados do cliente do pedido.
-        obs = _observacao_cliente(cli)
-        if obs:
-            updates["OBSERVACAO"] = obs
+            obs = _observacao_cliente(cli)
+            if obs:
+                updates["OBSERVACAO"] = obs
 
-        _resolver_localizacao_cliente(cur, cli)
-        if cli.get("id_cidade"):
-            updates["ID_CIDADE"] = cli["id_cidade"][: lim.ID_CIDADE]
+            _resolver_localizacao_cliente(cur, cli)
+            if cli.get("id_cidade"):
+                updates["ID_CIDADE"] = cli["id_cidade"][: lim.ID_CIDADE]
 
         ddd, fone = _telefone_para_db(cli)
         if ddd and fone:

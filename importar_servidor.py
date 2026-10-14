@@ -214,6 +214,9 @@ class Handler(BaseHTTPRequestHandler):
             )
         except (TypeError, ValueError):
             cliente_id_escolhido = None
+        atualizar_endereco = payload.get("atualizar_endereco")
+        if not isinstance(atualizar_endereco, bool):
+            atualizar_endereco = None
         numero = _extrair_numero_pedido(payload)
         if not numero:
             self._enviar_json(
@@ -261,6 +264,7 @@ class Handler(BaseHTTPRequestHandler):
                 reprints_por_ref=reprints_por_ref,
                 itens_extensao=itens_extensao,
                 cliente_id_escolhido=cliente_id_escolhido,
+                atualizar_endereco=atualizar_endereco,
                 on_log=on_log,
             )
         except Exception as exc:
