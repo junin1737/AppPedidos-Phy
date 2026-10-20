@@ -1125,10 +1125,76 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+", re.I)
 
 
 def limpar_trecho_parenteses_site(texto: str) -> str:
-    """Remove «(e-mail)» / «(apelido)» que o Tiao Cards coloca após o nome."""
-    s = re.sub(r"\s*\([^)]*\)", " ", texto or "")
+    """Remove TUDO entre parênteses (e-mail/apelido após o nome do site).
+
+    Regra do negócio: conteúdo entre parênteses na frente do nome NUNCA é
+    nome, endereço, complemento ou qualquer dado do cliente — é descartado,
+    mesmo quebrado/sem fechar (ex.: «Gabriel Oliveira (» + «:Dhare-)»).
+    Exceção: «(11)» de telefone (DDD, só 2 dígitos) não é apelido.
+    """
+    s = texto or ""
+    ddds: list[str] = []
+
+    def _manter_ddd(m: re.Match) -> str:
+        conteudo = m.group(1).strip()
+        if re.fullmatch(r"\d{2}", conteudo):
+            ddds.append(m.group(0))
+            return f"\x00{len(ddds) - 1}\x00"
+        return " "
+
+    # Balanceados (inclusive aninhados), preservando só (DD).
+    while True:
+        novo = re.sub(r"\(([^()]*)\)", _manter_ddd, s)
+        if novo == s:
+            break
+        s = novo
+    # Não fechou: descarta de «(» até o fim; não abriu: descarta até «)».
+    s = re.sub(r"\(.*$", " ", s, flags=re.S)
+    s = re.sub(r"^[^()]*\)", " ", s)
+    # Fragmento solto com parêntese (ex.: «:Dhare-)», «(Nick») vira lixo.
+    s = re.sub(r"\S*[()]\S*", " ", s)
     s = _EMAIL_RE.sub(" ", s)
-    return re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[()]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" ,")
+    for i, ddd in enumerate(ddds):
+        s = s.replace(f"\x00{i}\x00", ddd)
+    return s
+
+
+def descartar_parenteses_de_linhas(linhas: list[str]) -> list[str]:
+    """Descarta conteúdo entre parênteses MESMO quebrado em várias linhas.
+
+    O HTML/innerText pode partir «Gabriel Oliveira (:Dhare-)» em
+    «Gabriel Oliveira (» / «:Dhare-» / «)» — cada fragmento isolado parece
+    texto válido e vazava como logradouro. Aqui o estado «dentro de
+    parênteses» atravessa as linhas e tudo é jogado fora.
+    Preserva «(DD)» de telefone.
+    """
+    saida: list[str] = []
+    dentro = False
+    for linha in linhas or []:
+        original = str(linha or "")
+        # Telefone «(11) 99999-...»: mantém a linha intacta.
+        if re.search(r"\(\d{2}\)\s*\d", original):
+            if not dentro:
+                saida.append(original.strip())
+            continue
+        limpa_chars: list[str] = []
+        for ch in original:
+            if dentro:
+                if ch == ")":
+                    dentro = False
+                continue
+            if ch == "(":
+                dentro = True
+                continue
+            if ch == ")":
+                continue
+            limpa_chars.append(ch)
+        limpa = limpar_trecho_parenteses_site("".join(limpa_chars))
+        if limpa:
+            saida.append(limpa)
+    return saida
 
 
 def texto_parece_email(texto: str) -> bool:

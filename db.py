@@ -957,7 +957,7 @@ def _linha_lixo_endereco(lin: str, apelido: str | None = None) -> bool:
 
 def _montar_linha_endereco_site(cli: dict) -> str:
     """«Avenida B, Número 07 - Mercadinho Mais Econômico» — padrão CLIPP."""
-    salvo = (cli.get("endereco_completo_site") or "").strip()
+    salvo = limpar_trecho_parenteses_site(cli.get("endereco_completo_site") or "")
     if salvo and not re.match(r"^[\(\),\s-]+$", salvo):
         return salvo
     tipo = (cli.get("end_tipo") or "").strip()
@@ -977,7 +977,7 @@ def _montar_observacao_padrao_clipp(cli: dict) -> str:
     """Bloco multilinha igual ao cadastro manual (2º print)."""
     linhas: list[str] = []
     # Ignora apelido/nick entre parênteses (em qualquer posição do nome).
-    nome = re.sub(r"\s*\([^)]*\)\s*", " ", (cli.get("nome") or "")).strip()
+    nome = limpar_trecho_parenteses_site(cli.get("nome") or "")
     if nome:
         linhas.append(nome)
     linha_end = _montar_linha_endereco_site(cli)
@@ -1002,28 +1002,42 @@ def _montar_observacao_padrao_clipp(cli: dict) -> str:
 
 
 def _sanitizar_campos_endereco_cli(cli: dict) -> None:
-    """Remove lixo «(», «)», apelido nos campos de endereço."""
-    apelido = (cli.get("apelido_site") or "").strip()
-    for chave in ("end_lograd", "end_numero", "end_bairro"):
-        val = (cli.get(chave) or "").strip()
-        if not val or re.match(r"^[\(\)]+$", val):
-            cli.pop(chave, None)
+    """Barreira final: NADA entre parênteses entra em nome/endereço do CLIPP.
+
+    Limpa todos os campos textuais do cliente (não só logradouro): se sobrar
+    só lixo (apelido/e-mail/parêntese), o campo é descartado em vez de
+    sobrescrever o cadastro. O apelido do site nunca é persistido.
+    """
+    cli.pop("apelido_site", None)
+    if cli.get("nome"):
+        nome_limpo = limpar_trecho_parenteses_site(cli["nome"])
+        # Cadastro antigo contaminado (ex.: «:Dhare-» sem parênteses): sem nome válido, mantém vazio.
+        cli["nome"] = "" if (":" in nome_limpo or "@" in nome_limpo) else nome_limpo
+    apelido = ""
+    for chave in (
+        "end_tipo",
+        "end_lograd",
+        "end_numero",
+        "end_bairro",
+        "end_comple",
+        "texto_complemento_site",
+        "endereco_completo_site",
+        "cidade",
+    ):
+        bruto = cli.get(chave)
+        if bruto is None:
             continue
-        if apelido and re.sub(r"[\(\)]", "", val).lower() == apelido.lower():
-            cli.pop(chave, None)
-            continue
-        if chave == "end_lograd" and (
-            _linha_lixo_endereco(val, apelido)
-            or linha_e_apelido_nick(val, apelido)
+        val = limpar_trecho_parenteses_site(str(bruto))
+        if (
+            not val
             or texto_parece_email(val)
+            or (chave == "end_lograd" and (":" in val or "@" in val))
+            or _linha_lixo_endereco(val, apelido)
+            or (chave == "end_lograd" and linha_e_apelido_nick(val, apelido))
         ):
             cli.pop(chave, None)
-    apelido = (cli.get("apelido_site") or "").strip()
-    comple = (cli.get("end_comple") or "").strip()
-    if apelido and comple == apelido:
-        cli.pop("end_comple", None)
-    if comple and re.match(r"^[\(\)]+$", comple):
-        cli.pop("end_comple", None)
+            continue
+        cli[chave] = val
 
 
 def _montar_endereco_completo_site(cli: dict) -> str:
@@ -1062,6 +1076,7 @@ def _preparar_complemento_e_observacao(cli: dict) -> None:
 
 def normalizar_endereco_cliente(cli: dict) -> None:
     """Alinha END_TIPO + END_LOGRAD; não inventa «Rua» nem mistura apelido no endereço."""
+    _sanitizar_campos_endereco_cli(cli)
     tipo = (cli.get("end_tipo") or "").strip()
     lograd = (cli.get("end_lograd") or "").strip()
     if not tipo and lograd:
@@ -4801,9 +4816,9 @@ def obter_destinatario_etiqueta(db_cfg: dict, id_etiqueta: int) -> dict | None:
                 if pj and pj[0]:
                     cpf_cnpj = pj[0].strip()
 
-        tipo = (r[12] or "").strip()
+        tipo = limpar_trecho_parenteses_site((r[12] or "").strip())
         logr = limpar_trecho_parenteses_site((r[13] or "").strip())
-        if texto_parece_email(logr):
+        if texto_parece_email(logr) or ":" in logr or "@" in logr:
             tipo, logr = "", ""
         logradouro = f"{tipo} {logr}".strip() if tipo else logr
         ddd = (r[17] or "").strip()
@@ -4824,10 +4839,10 @@ def obter_destinatario_etiqueta(db_cfg: dict, id_etiqueta: int) -> dict | None:
             "nome": limpar_trecho_parenteses_site((r[10] or "").strip()),
             "cep": (r[11] or "").strip(),
             "logradouro": logradouro,
-            "numero": (r[14] or "").strip(),
-            "bairro": (r[15] or "").strip(),
-            "complemento": (r[16] or "").strip(),
-            "cidade": (r[19] or "").strip(),
+            "numero": limpar_trecho_parenteses_site((r[14] or "").strip()),
+            "bairro": limpar_trecho_parenteses_site((r[15] or "").strip()),
+            "complemento": limpar_trecho_parenteses_site((r[16] or "").strip()),
+            "cidade": limpar_trecho_parenteses_site((r[19] or "").strip()),
             "uf": (r[20] or "").strip(),
             "celular": (ddd + fone) if fone else "",
             "cpfCnpj": cpf_cnpj,

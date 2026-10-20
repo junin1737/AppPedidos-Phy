@@ -6,7 +6,7 @@ resposta JSON para a extensão. Usado por importar_servidor e importar_site.
 
 from __future__ import annotations
 
-VERSAO = "2026.10.13-1"
+VERSAO = "2026.10.20-1"
 
 from collections.abc import Callable
 

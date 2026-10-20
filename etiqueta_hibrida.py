@@ -290,11 +290,15 @@ def _sanitizar_destinatario_item(item: dict, dest_clipp: dict | None = None) -> 
         dest["endereco"] = end
 
     nome = limpar_trecho_parenteses_site(dest.get("nome") or "")
+    if ":" in nome or "@" in nome:
+        nome = ""
     logr = limpar_trecho_parenteses_site(end.get("logradouro") or "")
+    if ":" in logr or "@" in logr:
+        logr = ""
     if dest_clipp:
-        if not nome or texto_parece_email(dest.get("nome") or ""):
+        if not nome:
             nome = limpar_trecho_parenteses_site(dest_clipp.get("nome") or "")
-        if not logr or texto_parece_email(end.get("logradouro") or ""):
+        if not logr:
             logr = limpar_trecho_parenteses_site(dest_clipp.get("logradouro") or "")
             if dest_clipp.get("numero"):
                 end["numero"] = dest_clipp["numero"]

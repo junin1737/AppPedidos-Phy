@@ -47,6 +47,7 @@ from parser_pedido import (
     normalizar_referencia_site,
     _nucleo_referencia,
     limpar_trecho_parenteses_site,
+    descartar_parenteses_de_linhas,
     texto_parece_email,
 )
 
@@ -267,6 +268,9 @@ def _parse_bloco_endereco_cliente(linhas_cli: list[str]) -> dict:
     cli: dict = {}
     restantes: list[str] = []
     telefones: list[str] = []
+    # PRIMEIRO passo: joga fora tudo entre parênteses (apelido/e-mail após o
+    # nome), mesmo quebrado em linhas — essa informação não é usada p/ nada.
+    linhas_cli = descartar_parenteses_de_linhas(linhas_cli)
     apelido_bloco = _apelido_do_bloco(linhas_cli)
 
     for linha in linhas_cli:
@@ -324,28 +328,27 @@ def _parse_bloco_endereco_cliente(linhas_cli: list[str]) -> dict:
         return cli
 
     nome_lin = restantes[0]
-    m_apel = re.search(r"\(([^)]+)\)\s*$", nome_lin)
-    if m_apel and not texto_parece_email(m_apel.group(1)):
-        cli["apelido_site"] = m_apel.group(1).strip()[:40]
-    elif apelido_bloco:
-        cli["apelido_site"] = apelido_bloco[:40]
+    # Apelido NÃO é gravado em cli: é só lixo a descartar, nunca um dado.
+    apelido_local = apelido_bloco
     cli["nome"] = _limpar_nome_cliente(nome_lin)
 
     idx = 1
-    apelido = cli.get("apelido_site") or apelido_bloco
+    apelido = apelido_local
     tem_logradouro_depois = any(_parece_logradouro(r) for r in restantes[1:])
     while idx < len(restantes):
         lin_skip = restantes[idx].strip()
         if _linha_lixo_endereco(lin_skip, apelido):
-            if not cli.get("apelido_site") and linha_e_apelido_nick(lin_skip):
-                cli["apelido_site"] = lin_skip[:40]
+            if not apelido_local and linha_e_apelido_nick(lin_skip):
+                apelido_local = lin_skip[:40]
+                apelido = apelido_local
             idx += 1
             continue
         # Apelido «pelado» (ex.: «Jdai», sem parênteses) quando ainda há um
         # logradouro de verdade nas próximas linhas: trata como apelido, não rua.
         if tem_logradouro_depois and _bare_nick_candidato(lin_skip):
-            if not cli.get("apelido_site"):
-                cli["apelido_site"] = lin_skip[:40]
+            if not apelido_local:
+                apelido_local = lin_skip[:40]
+                apelido = apelido_local
             idx += 1
             continue
         break

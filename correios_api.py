@@ -184,7 +184,7 @@ def _split_ddd(numero: Any) -> tuple[str, str]:
 def montar_endereco(dados: dict) -> dict:
     """Monta o bloco `endereco` no formato dos Correios a partir de um dict simples."""
     logr = limpar_trecho_parenteses_site(dados.get("logradouro") or "")
-    if texto_parece_email(logr):
+    if texto_parece_email(logr) or ":" in logr or "@" in logr:
         logr = ""
     end = {
         "cep": _somente_digitos(dados.get("cep")),
